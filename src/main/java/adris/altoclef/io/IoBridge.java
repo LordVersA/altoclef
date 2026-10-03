@@ -306,6 +306,7 @@ public final class IoBridge {
                 case "task.goto" -> startGoto(callId, args);
                 case "prim.equip" -> startEquip(callId, args);
                 case "prim.dig" -> startDig(callId, args);
+                case "prim.place" -> startPlace(callId, args);
                 case "task.food" -> startFood(callId, args.path("count").asInt(20));
                 case "task.follow" -> startFollow(callId, args);
                 case "task.give" -> startGive(callId, args);
@@ -336,6 +337,8 @@ public final class IoBridge {
             value.put("item", item);
             value.put("canGet", TaskCatalogue.taskExists(item));
             value.put("validItem", Registries.ITEM.containsId(net.minecraft.util.Identifier.of("minecraft", item)));
+            value.put("validBlock", Registries.BLOCK.containsId(net.minecraft.util.Identifier.of("minecraft", item))
+                    && Registries.ITEM.get(net.minecraft.util.Identifier.of("minecraft", item)) instanceof net.minecraft.item.BlockItem);
             var recipe = smeltingRecipe(item);
             if (recipe.isPresent()) value.put("smeltOutput", net.minecraft.registry.Registries.ITEM.getId(
                     recipe.get().value().getResult(mod.getWorld().getRegistryManager()).getItem()).getPath());
@@ -353,11 +356,15 @@ public final class IoBridge {
             long volume = ((long) to.getX() - from.getX() + 1) * ((long) to.getY() - from.getY() + 1) * ((long) to.getZ() - from.getZ() + 1);
             if (volume > 32768) throw new IllegalArgumentException("query region exceeds 32768 blocks");
             ObjectNode blocks = value.putObject("blocks");
+            ObjectNode solid = args.path("details").asBoolean(false) ? value.putObject("solidBlocks") : null;
+            if (solid != null && volume > 4096) throw new IllegalArgumentException("detailed region exceeds 4096 blocks");
             boolean complete = true;
             for (BlockPos pos : BlockPos.iterate(from, to)) {
                 if (!isLoaded(pos)) { complete = false; continue; }
                 blocks.put(pos.getX() + "," + pos.getY() + "," + pos.getZ(), net.minecraft.registry.Registries.BLOCK.getId(
                         mod.getWorld().getBlockState(pos).getBlock()).getPath());
+                if (solid != null) solid.put(pos.getX() + "," + pos.getY() + "," + pos.getZ(),
+                        mod.getWorld().getBlockState(pos).isSolidBlock(mod.getWorld(), pos));
             }
             value.put("complete", complete);
         } else if ("query.entities".equals(op)) {
@@ -384,6 +391,54 @@ public final class IoBridge {
         var item = net.minecraft.registry.Registries.ITEM.get(id);
         return mod.getPlayer().networkHandler.getRecipeManager().getFirstMatch(net.minecraft.recipe.RecipeType.SMELTING,
                 new net.minecraft.recipe.input.SingleStackRecipeInput(new net.minecraft.item.ItemStack(item)), mod.getWorld());
+    }
+
+    private void startPlace(String callId, JsonNode args) {
+        BlockPos pos = readPosition(args.path("pos"));
+        String name = args.path("block").asText();
+        var id = net.minecraft.util.Identifier.of("minecraft", name);
+        if (!Registries.BLOCK.containsId(id) || !(Registries.ITEM.get(id) instanceof net.minecraft.item.BlockItem)) {
+            result(callId, "failed", "unknown_block", null); return;
+        }
+        var task = new IoPlaceTask(pos, Registries.BLOCK.get(id), name);
+        PartialSupplier observed = () -> {
+            ObjectNode value = json.createObjectNode().put("block", name);
+            value.putObject("pos").put("x", pos.getX()).put("y", pos.getY()).put("z", pos.getZ());
+            return value;
+        };
+        beginTask(callId, task, () -> result(callId, task.failure == null ? "ok" : "failed", task.failure, observed.get()), observed);
+    }
+
+    private final class IoPlaceTask extends Task implements ITaskRequiresGrounded {
+        private final BlockPos pos;
+        private final net.minecraft.block.Block block;
+        private final String name;
+        private final Task place;
+        private String failure;
+        IoPlaceTask(BlockPos pos, net.minecraft.block.Block block, String name) {
+            this.pos = pos; this.block = block; this.name = name;
+            place = new adris.altoclef.tasks.construction.PlaceBlockTask(pos, block);
+        }
+        @Override protected void onStart() { }
+        @Override protected Task onTick() {
+            if (!isLoaded(pos)) { failure = "place_failed"; return null; }
+            var state = mod.getWorld().getBlockState(pos);
+            if (!state.isReplaceable() || !state.getFluidState().isEmpty()) { failure = "position_occupied"; return null; }
+            if (countOf(name) < 1) { failure = "not_in_inventory"; return null; }
+            boolean support = false;
+            for (var direction : net.minecraft.util.math.Direction.values()) {
+                var at = pos.offset(direction);
+                if (isLoaded(at) && mod.getWorld().getBlockState(at).isSolidBlock(mod.getWorld(), at)) support = true;
+            }
+            if (!support) { failure = "nothing_to_place_against"; return null; }
+            return place;
+        }
+        @Override public boolean isFinished() {
+            return failure != null || (isLoaded(pos) && mod.getWorld().getBlockState(pos).getBlock() == block);
+        }
+        @Override protected void onStop(Task interrupt) { }
+        @Override protected boolean isEqual(Task other) { return this == other; }
+        @Override protected String toDebugString() { return "IO place " + pos; }
     }
 
     private String digRefusal(BlockPos pos, String expected, boolean allowLiquid) {
