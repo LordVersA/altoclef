@@ -1606,7 +1606,7 @@ public final class IoBridge {
         BlockPos pos = readPosition(args.path("pos"));
         String expected = args.path("expectedBlock").asText();
         if (!expected.matches("[a-z0-9_]{1,128}")) throw new IllegalArgumentException("invalid expected block");
-        var task = new IoDigTask(pos, expected, args.path("collect").asBoolean(true), args.path("allowLiquid").asBoolean(false), args.path("ripeOnly").asBoolean(false), args.path("allowUp").asBoolean(false));
+        var task = new IoDigTask(pos, expected, args.path("collect").asBoolean(true), args.path("allowLiquid").asBoolean(false), args.path("ripeOnly").asBoolean(false), args.path("allowUp").asBoolean(false), args.path("preserveSurroundings").asBoolean(false));
         PartialSupplier observed = () -> {
             ObjectNode value = json.createObjectNode().put("block", expected);
             value.putObject("pos").put("x", pos.getX()).put("y", pos.getY()).put("z", pos.getZ());
@@ -1620,12 +1620,12 @@ public final class IoBridge {
         private final String expected;
         private final boolean collect;
         private final boolean allowLiquid;
-        private final boolean ripeOnly,allowUp;
+        private final boolean ripeOnly,allowUp,preserveSurroundings;
         private final Task destroy;
         private String failure;
         private long brokenAt;
-        IoDigTask(BlockPos pos, String expected, boolean collect, boolean allowLiquid, boolean ripeOnly, boolean allowUp) {
-            this.pos = pos; this.expected = expected; this.collect = collect; this.allowLiquid = allowLiquid; this.ripeOnly = ripeOnly; this.allowUp = allowUp;
+        IoDigTask(BlockPos pos, String expected, boolean collect, boolean allowLiquid, boolean ripeOnly, boolean allowUp, boolean preserveSurroundings) {
+            this.pos = pos; this.expected = expected; this.collect = collect; this.allowLiquid = allowLiquid; this.ripeOnly = ripeOnly; this.allowUp = allowUp; this.preserveSurroundings=preserveSurroundings;
             destroy = new adris.altoclef.tasks.construction.DestroyBlockTask(pos);
         }
         private boolean gone() {
@@ -1636,7 +1636,9 @@ public final class IoBridge {
                     .filter(entity -> entity.isAlive() && entity.squaredDistanceTo(net.minecraft.util.math.Vec3d.ofCenter(pos)) <= 16)
                     .min(java.util.Comparator.comparingDouble(entity -> entity.squaredDistanceTo(mod.getPlayer())));
         }
-        @Override protected void onStart() { }
+        @Override protected void onStart() {
+            if (preserveSurroundings) { mod.getBehaviour().push(); mod.getBehaviour().avoidBlockBreaking(p->!p.equals(pos)); }
+        }
         @Override protected Task onTick() {
             failure = digRefusal(pos, expected, allowLiquid, allowUp);
             if (failure == null && ripeOnly && !gone()) {
@@ -1674,7 +1676,9 @@ public final class IoBridge {
             return failure != null || (gone() && (!collect || (brokenAt != 0
                     && System.currentTimeMillis() - brokenAt >= 400 && (nearbyDrop().isEmpty() || System.currentTimeMillis() - brokenAt >= 8000))));
         }
-        @Override protected void onStop(Task interrupt) { }
+        @Override protected void onStop(Task interrupt) {
+            if (preserveSurroundings) { mod.getClientBaritone().getPathingBehavior().forceCancel(); mod.getBehaviour().pop(); }
+        }
         @Override protected boolean isEqual(Task other) { return this == other; }
         @Override protected String toDebugString() { return "IO dig " + pos; }
     }
