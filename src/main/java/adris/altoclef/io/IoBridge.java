@@ -397,7 +397,7 @@ public final class IoBridge {
             value.put("complete", complete);
         } else if ("query.findBlocks".equals(op)) {
             int radius = args.path("radius").asInt(16), limit = args.path("limit").asInt(1);
-            if (radius < 1 || radius > 64 || limit < 1 || limit > 64 || !args.path("blocks").isArray()
+            if (radius < 1 || radius > 64 || limit < 1 || limit > 256 || !args.path("blocks").isArray()
                     || args.path("blocks").size() < 1 || args.path("blocks").size() > 32)
                 throw new IllegalArgumentException("invalid bounded block search");
             java.util.Set<net.minecraft.block.Block> wanted = new java.util.HashSet<>();
@@ -413,6 +413,7 @@ public final class IoBridge {
                 long chunk = net.minecraft.util.math.ChunkPos.toLong(pos.getX() >> 4, pos.getZ() >> 4);
                 if (!loadedChunks.computeIfAbsent(chunk, key -> isLoaded(pos))) continue;
                 if (wanted.contains(mod.getWorld().getBlockState(pos).getBlock())
+                        && (!args.path("ripeOnly").asBoolean(false) || (mod.getWorld().getBlockState(pos).getBlock() instanceof net.minecraft.block.CropBlock crop && crop.isMature(mod.getWorld().getBlockState(pos))))
                         && (!args.path("sourceFluidOnly").asBoolean(false) || mod.getWorld().getFluidState(pos).isStill())) {
                     hits.add(pos.toImmutable()); if (hits.size() > limit) hits.poll();
                 }
@@ -1514,7 +1515,7 @@ public final class IoBridge {
         BlockPos pos = readPosition(args.path("pos"));
         String expected = args.path("expectedBlock").asText();
         if (!expected.matches("[a-z0-9_]{1,128}")) throw new IllegalArgumentException("invalid expected block");
-        var task = new IoDigTask(pos, expected, args.path("collect").asBoolean(true), args.path("allowLiquid").asBoolean(false));
+        var task = new IoDigTask(pos, expected, args.path("collect").asBoolean(true), args.path("allowLiquid").asBoolean(false), args.path("ripeOnly").asBoolean(false));
         PartialSupplier observed = () -> {
             ObjectNode value = json.createObjectNode().put("block", expected);
             value.putObject("pos").put("x", pos.getX()).put("y", pos.getY()).put("z", pos.getZ());
@@ -1528,11 +1529,12 @@ public final class IoBridge {
         private final String expected;
         private final boolean collect;
         private final boolean allowLiquid;
+        private final boolean ripeOnly;
         private final Task destroy;
         private String failure;
         private long brokenAt;
-        IoDigTask(BlockPos pos, String expected, boolean collect, boolean allowLiquid) {
-            this.pos = pos; this.expected = expected; this.collect = collect; this.allowLiquid = allowLiquid;
+        IoDigTask(BlockPos pos, String expected, boolean collect, boolean allowLiquid, boolean ripeOnly) {
+            this.pos = pos; this.expected = expected; this.collect = collect; this.allowLiquid = allowLiquid; this.ripeOnly = ripeOnly;
             destroy = new adris.altoclef.tasks.construction.DestroyBlockTask(pos);
         }
         private boolean gone() {
@@ -1546,6 +1548,30 @@ public final class IoBridge {
         @Override protected void onStart() { }
         @Override protected Task onTick() {
             failure = digRefusal(pos, expected, allowLiquid);
+            if (failure == null && ripeOnly && !gone()) {
+                var state = mod.getWorld().getBlockState(pos);
+                if (!(state.getBlock() instanceof net.minecraft.block.CropBlock crop) || !crop.isMature(state)) failure = "nothing_ripe";
+                if (failure == null) {
+                    var drops = switch (expected) {
+                        case "wheat" -> new net.minecraft.item.Item[]{net.minecraft.item.Items.WHEAT,net.minecraft.item.Items.WHEAT_SEEDS};
+                        case "beetroots" -> new net.minecraft.item.Item[]{net.minecraft.item.Items.BEETROOT,net.minecraft.item.Items.BEETROOT_SEEDS};
+                        case "carrots" -> new net.minecraft.item.Item[]{net.minecraft.item.Items.CARROT};
+                        case "potatoes" -> new net.minecraft.item.Item[]{net.minecraft.item.Items.POTATO,net.minecraft.item.Items.POISONOUS_POTATO};
+                        default -> new net.minecraft.item.Item[0];
+                    };
+                    int empty=0;
+                    for (int i=0;i<36;i++) if (mod.getPlayer().getInventory().getStack(i).isEmpty()) empty++;
+                    for (var drop : drops) {
+                        // Conservative room for a crop's loot, including Fortune and rare potatoes.
+                        int room=0;
+                        for (int i=0;i<36;i++) {
+                            var held=mod.getPlayer().getInventory().getStack(i);
+                            if (ItemStack.areItemsAndComponentsEqual(held,new ItemStack(drop))) room+=held.getMaxCount()-held.getCount();
+                        }
+                        if (room<16 && --empty<0) { failure="inventory_full"; break; }
+                    }
+                }
+            }
             if (failure != null) return null;
             if (!gone()) return destroy;
             if (brokenAt == 0) brokenAt = System.currentTimeMillis();
