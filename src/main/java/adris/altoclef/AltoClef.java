@@ -210,6 +210,7 @@ public class AltoClef implements ModInitializer {
 
         // IO: the bridge to Core, if configured.
         adris.altoclef.io.IoBridge.start(this);
+        adris.altoclef.io.IoClientWindow.start();
 
         // External mod initialization
         runEnqueuedPostInits();
