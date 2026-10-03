@@ -33,6 +33,7 @@ public class GiveItemToPlayerTask extends Task {
     private GotoTarget cords = null;
 
     private Task throwTask;
+    private int droppedCount;
 
     public GiveItemToPlayerTask(String player, ItemTarget... targets) {
         playerName = player;
@@ -52,6 +53,10 @@ public class GiveItemToPlayerTask extends Task {
         droppingItems = false;
         atGoal = false;
         throwTarget.clear();
+        droppedCount = 0;
+        // Adapted from ChatClef: protect the gift for the lifetime of the task.
+        AltoClef.getInstance().getBehaviour().push();
+        AltoClef.getInstance().getBehaviour().addProtectedItems(ItemTarget.getMatches(targets));
     }
 
     @Override
@@ -73,7 +78,8 @@ public class GiveItemToPlayerTask extends Task {
         }
 
 
-        if (!StorageHelper.itemTargetsMet(mod, targets)) {
+        // Once delivery starts, remaining inventory can legitimately be below the original goal.
+        if (!droppingItems && !StorageHelper.itemTargetsMet(mod, targets)) {
             setDebugState("Collecting resources...");
             return resourceTask;
         }
@@ -92,8 +98,13 @@ public class GiveItemToPlayerTask extends Task {
         }
 
         if (droppingItems) {
-            // For each target, pick up its stack and then throw it
-            for (ItemTarget target : throwTarget) {
+            if (!targetPos.isInRange(mod.getPlayer().getPos(), 4)) {
+                return new FollowPlayerTask(playerName);
+            }
+            // ChatClef tracks remaining targets, but throws entire stacks even for a partial gift.
+            // Throw a whole stack only when it fits in the remaining request.
+            for (int i = 0; i < throwTarget.size(); i++) {
+                ItemTarget target = throwTarget.get(i);
                 if (target.getTargetCount() <= 0) continue;
 
                 // Find a slot with item
@@ -102,15 +113,22 @@ public class GiveItemToPlayerTask extends Task {
                         .stream()
                         .findFirst();
 
-                if (maybeSlot.isEmpty()) continue;
+                if (maybeSlot.isEmpty() || !mod.getSlotHandler().canDoSlotAction()) return null;
                 Slot slot = maybeSlot.get();
 
                 // LOOK & DEBUG once per action
                 setDebugState("Throwing items");
                 LookHelper.lookAt(mod, targetPos);
 
-                //Throws entire stack of items
-                mod.getSlotHandler().clickSlot(slot, 1, SlotActionType.THROW);
+                int before = StorageHelper.getItemStackInSlot(slot).getCount();
+                int button = before <= target.getTargetCount() ? 1 : 0;
+                mod.getSlotHandler().clickSlot(slot, button, SlotActionType.THROW);
+                int thrown = before - StorageHelper.getItemStackInSlot(slot).getCount();
+                if (thrown > 0) {
+                    throwTarget.set(i, new ItemTarget(target, target.getTargetCount() - thrown));
+                    droppedCount += thrown;
+                }
+                return null;
             }
             mod.log("Finished giving items.");
             stop();
@@ -133,7 +151,11 @@ public class GiveItemToPlayerTask extends Task {
 
     @Override
     protected void onStop(Task interruptTask) {
+        AltoClef.getInstance().getBehaviour().pop();
+    }
 
+    public int getDroppedCount() {
+        return droppedCount;
     }
 
     @Override
