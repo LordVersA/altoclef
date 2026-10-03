@@ -304,6 +304,7 @@ public final class IoBridge {
                     else startGet(callId, args.path("item").asText(), args.path("count").asInt(1), args.path("additional").asBoolean(false));
                 }
                 case "task.goto" -> startGoto(callId, args);
+                case "prim.equip" -> startEquip(callId, args);
                 case "task.food" -> startFood(callId, args.path("count").asInt(20));
                 case "task.follow" -> startFollow(callId, args);
                 case "task.give" -> startGive(callId, args);
@@ -381,6 +382,74 @@ public final class IoBridge {
         var item = net.minecraft.registry.Registries.ITEM.get(id);
         return mod.getPlayer().networkHandler.getRecipeManager().getFirstMatch(net.minecraft.recipe.RecipeType.SMELTING,
                 new net.minecraft.recipe.input.SingleStackRecipeInput(new net.minecraft.item.ItemStack(item)), mod.getWorld());
+    }
+
+    private net.minecraft.entity.EquipmentSlot equipmentSlot(String slot) {
+        return switch (slot) {
+            case "hand" -> net.minecraft.entity.EquipmentSlot.MAINHAND;
+            case "head" -> net.minecraft.entity.EquipmentSlot.HEAD;
+            case "torso" -> net.minecraft.entity.EquipmentSlot.CHEST;
+            case "legs" -> net.minecraft.entity.EquipmentSlot.LEGS;
+            case "feet" -> net.minecraft.entity.EquipmentSlot.FEET;
+            default -> throw new IllegalArgumentException("invalid equipment slot");
+        };
+    }
+
+    private void startEquip(String callId, JsonNode args) {
+        String name = args.path("item").asText();
+        String slotName = args.path("slot").asText();
+        var slot = equipmentSlot(slotName);
+        var id = net.minecraft.util.Identifier.of("minecraft", name);
+        if (!net.minecraft.registry.Registries.ITEM.containsId(id) || countOf(name) < 1) {
+            result(callId, "failed", "nothing_to_equip", null); return;
+        }
+        var item = net.minecraft.registry.Registries.ITEM.get(id);
+        if (slot != net.minecraft.entity.EquipmentSlot.MAINHAND
+                && (!(item instanceof net.minecraft.item.ArmorItem armor) || armor.getSlotType() != slot)) {
+            result(callId, "failed", "equip_failed", null); return;
+        }
+        var task = new IoEquipTask(item, slot);
+        beginTask(callId, task, () -> result(callId, task.isFinished() ? "ok" : "failed",
+                task.isFinished() ? null : "equip_failed", json.createObjectNode().put("slot", slotName).put("item", name)),
+                () -> json.createObjectNode().put("slot", slotName).put("item", name));
+    }
+
+    private final class IoEquipTask extends Task {
+        private final net.minecraft.item.Item item;
+        private final net.minecraft.entity.EquipmentSlot slot;
+        IoEquipTask(net.minecraft.item.Item item, net.minecraft.entity.EquipmentSlot slot) {
+            this.item = item; this.slot = slot;
+        }
+        @Override protected void onStart() { }
+        @Override protected Task onTick() {
+            var cursor = adris.altoclef.util.helpers.StorageHelper.getItemStackInCursorSlot();
+            if (!cursor.isEmpty() && (slot == net.minecraft.entity.EquipmentSlot.MAINHAND
+                    || cursor.getItem() != item || mod.getPlayer().getEquippedStack(slot).getItem() == item)) {
+                mod.getItemStorage().getSlotThatCanFitInPlayerInventory(cursor, false).ifPresent(destination ->
+                        mod.getSlotHandler().clickSlot(destination, 0, net.minecraft.screen.slot.SlotActionType.PICKUP));
+                return null;
+            }
+            if (!(mod.getPlayer().currentScreenHandler instanceof net.minecraft.screen.PlayerScreenHandler)) {
+                adris.altoclef.util.helpers.StorageHelper.closeScreen(); return null;
+            }
+            if (slot == net.minecraft.entity.EquipmentSlot.MAINHAND) {
+                var sources = mod.getItemStorage().getSlotsWithItemPlayerInventory(false, item);
+                if (!sources.isEmpty() && mod.getSlotHandler().canDoSlotAction()) {
+                    mod.getPlayer().getInventory().selectedSlot = 1;
+                    mod.getSlotHandler().clickSlot(sources.get(0), 1, net.minecraft.screen.slot.SlotActionType.SWAP);
+                }
+                return null;
+            }
+            return new adris.altoclef.tasks.slot.MoveItemToSlotFromInventoryTask(new ItemTarget(item, 1),
+                    adris.altoclef.util.slots.PlayerSlot.getEquipSlot(slot));
+        }
+        @Override public boolean isFinished() {
+            return mod.getPlayer().getEquippedStack(slot).getItem() == item
+                    && adris.altoclef.util.helpers.StorageHelper.getItemStackInCursorSlot().isEmpty();
+        }
+        @Override protected void onStop(Task interrupt) { }
+        @Override protected boolean isEqual(Task other) { return this == other; }
+        @Override protected String toDebugString() { return "IO equip " + item; }
     }
 
     private void startSmelt(String callId, JsonNode args) {
@@ -822,7 +891,11 @@ public final class IoBridge {
                 row.put("count", e.getValue());
             }
         }
-        p.putObject("equipment");
+        ObjectNode equipment = p.putObject("equipment");
+        if (player != null) for (String slot : new String[]{"hand", "head", "torso", "legs", "feet"}) {
+            ItemStack stack = player.getEquippedStack(equipmentSlot(slot));
+            equipment.put(slot, stack.isEmpty() ? null : Registries.ITEM.getId(stack.getItem()).getPath());
+        }
         ArrayNode running = p.putArray("running");
         if (runningCallId != null) running.add(runningCallId);
         p.put("chain", runningCallId != null ? "User Tasks" : null);
