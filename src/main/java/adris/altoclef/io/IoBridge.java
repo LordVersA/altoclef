@@ -1583,7 +1583,7 @@ public final class IoBridge {
         var feet = mod.getPlayer().getBlockPos();
         if (pos.getX() == feet.getX() && pos.getZ() == feet.getZ()
                 && (pos.getY() < feet.getY() || pos.getY() >= feet.getY() + 2)) {
-            if (!allowUp || pos.getY()!=feet.getY()+2 || !isLoaded(pos.up())
+            if (!allowUp || pos.getY()<feet.getY()+2 || (pos.getY()!=feet.getY()+2 && !state.isIn(net.minecraft.registry.tag.BlockTags.LOGS)) || !isLoaded(pos.up())
                     || mod.getWorld().getBlockState(pos.up()).getBlock() instanceof net.minecraft.block.FallingBlock)
                 return "unsafe_dig";
         }
