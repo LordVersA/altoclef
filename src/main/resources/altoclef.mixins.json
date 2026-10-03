@@ -29,6 +29,7 @@
     "ClientTickMixin",
     "DrawableHelperInvoker",
     "EntryMixin",
+    "JoinInitMixin",
     "LoadChunkMixin",
     "MixinLocalPlayer",
     "PlayerCollidesWithEntityMixin",

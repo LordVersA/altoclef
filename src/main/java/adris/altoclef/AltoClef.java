@@ -116,6 +116,10 @@ public class AltoClef implements ModInitializer {
     public void onInitializeLoad() {
         // This code should be run after Minecraft loads everything else in.
         // This is the actual start point, controlled by a mixin.
+        // IO: it can be triggered by the title screen and by joining a world; run only once.
+        if (commandExecutor != null) {
+            return;
+        }
 
         initializeBaritoneSettings();
 

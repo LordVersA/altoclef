@@ -88,9 +88,19 @@ repositories {
         url = 'https://babbaj.github.io/maven/'
     }
     flatDir {
-        dirs '../baritone/dist'
+        // libs/baritone holds the Baritone jars built from source (see libs/baritone/SOURCE.md).
+        dirs "${rootDir}/libs/baritone", '../baritone/dist'
     }
 }
+
+// IO: use a Baritone jar built from source when there is one for this version, so the build does not
+// depend on MiranCZ's hosted Maven. A jar counts when it is in libs/baritone (vendored) or, with
+// -Paltoclef.development, in ../baritone/dist. Versions without one keep using the hosted Maven.
+// Pass -Paltoclef.published to use the hosted jar anyway.
+def localBaritoneName = "baritone-unoptimized-fabric-${project.name}.jar"
+def vendoredBaritone = !project.hasProperty("altoclef.published") &&
+        (file("${rootDir}/libs/baritone/${localBaritoneName}").exists() ||
+                (project.hasProperty("altoclef.development") && file("../baritone/dist/${localBaritoneName}").exists()))
 
 jvmdg {
     downgradeTo = getJavaVersion()
@@ -124,7 +134,7 @@ dependencies {
     shadow('com.fasterxml.jackson.core:jackson-databind:2.16.0')
 
     // Thank you georgeagostino for fixing my garbage
-    if (getProject().hasProperty("altoclef.development")) {
+    if (vendoredBaritone) {
         // Must run build from baritone-plus once
         modImplementation "baritone-api-fabric:baritone-unoptimized-fabric-${project.name}"
         include "baritone-api-fabric:baritone-unoptimized-fabric-${project.name}"
