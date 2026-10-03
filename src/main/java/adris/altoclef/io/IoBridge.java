@@ -334,6 +334,7 @@ public final class IoBridge {
             if (!item.matches("[a-z0-9_]{1,128}")) throw new IllegalArgumentException("invalid item");
             value.put("item", item);
             value.put("canGet", TaskCatalogue.taskExists(item));
+            value.put("validItem", Registries.ITEM.containsId(net.minecraft.util.Identifier.of("minecraft", item)));
             var recipe = smeltingRecipe(item);
             if (recipe.isPresent()) value.put("smeltOutput", net.minecraft.registry.Registries.ITEM.getId(
                     recipe.get().value().getResult(mod.getWorld().getRegistryManager()).getItem()).getPath());
@@ -611,6 +612,7 @@ public final class IoBridge {
 
     /** The result reports dropped items; the operator must independently verify pickup. */
     private void startGive(String callId, JsonNode args) {
+        if (args.path("heldOnly").asBoolean(false)) { startDropHeld(callId, args); return; }
         String player = args.path("player").asText();
         String item = args.path("item").asText();
         int count = args.path("count").asInt(1);
@@ -637,6 +639,75 @@ public final class IoBridge {
             value.put("remaining", countOf(item));
             return value;
         });
+    }
+
+    /** IO's inventory-only drop route never gathers replacement gifts. */
+    private void startDropHeld(String callId, JsonNode args) {
+        String name = args.path("item").asText();
+        String player = args.hasNonNull("player") ? args.path("player").asText() : null;
+        int count = args.path("count").asInt();
+        if (count < 1 || count > 2304 || (player != null && !player.matches("[A-Za-z0-9_]{1,16}")))
+            throw new IllegalArgumentException("invalid drop arguments");
+        var id = net.minecraft.util.Identifier.of("minecraft", name);
+        if (!Registries.ITEM.containsId(id)) { result(callId, "failed", "unknown_item", null); return; }
+        if (countOf(name) < count) { result(callId, "failed", "not_carrying", null); return; }
+        int before = countOf(name);
+        var task = new IoDropHeldTask(Registries.ITEM.get(id), count, player);
+        PartialSupplier observed = () -> json.createObjectNode().put("item", name).put("dropped", task.dropped)
+                .put("inventoryDecrease", before - countOf(name)).put("throwActions", task.actions);
+        beginTask(callId, task, () -> result(callId,
+                task.dropped == count ? "ok" : "failed", task.dropped == count ? null : "player_unreachable", observed.get()), observed);
+    }
+
+    private final class IoDropHeldTask extends Task {
+        private final net.minecraft.item.Item item;
+        private final int count;
+        private final String player;
+        private int dropped;
+        private int actions;
+        private boolean playerGone;
+        IoDropHeldTask(net.minecraft.item.Item item, int count, String player) {
+            this.item = item; this.count = count; this.player = player;
+        }
+        @Override protected void onStart() {
+            mod.getBehaviour().push(); mod.getBehaviour().addProtectedItems(item);
+        }
+        @Override protected Task onTick() {
+            if (player != null) {
+                var target = mod.getEntityTracker().getPlayerEntity(player);
+                if (target.isEmpty()) { playerGone = true; return null; }
+                if (target.get().distanceTo(mod.getPlayer()) > 2)
+                    return new GetToEntityTask(target.get(), 2);
+                adris.altoclef.util.helpers.LookHelper.lookAt(mod, target.get().getPos().add(0, 1.2, 0));
+            }
+            var cursor = StorageHelper.getItemStackInCursorSlot();
+            if (!cursor.isEmpty()) {
+                mod.getItemStorage().getSlotThatCanFitInPlayerInventory(cursor, false).ifPresent(destination ->
+                        mod.getSlotHandler().clickSlot(destination, 0, net.minecraft.screen.slot.SlotActionType.PICKUP));
+                return null;
+            }
+            if (!(mod.getPlayer().currentScreenHandler instanceof net.minecraft.screen.PlayerScreenHandler)) {
+                StorageHelper.closeScreen(); return null;
+            }
+            var sources = mod.getItemStorage().getSlotsWithItemPlayerInventory(false, item);
+            if (!sources.isEmpty() && mod.getSlotHandler().canDoSlotAction()) {
+                var source = sources.stream()
+                        .filter(candidate -> StorageHelper.getItemStackInSlot(candidate).getCount() <= count - dropped)
+                        .max(java.util.Comparator.comparingInt(candidate -> StorageHelper.getItemStackInSlot(candidate).getCount()))
+                        .orElse(sources.get(0));
+                int before = StorageHelper.getItemStackInSlot(source).getCount();
+                // A whole inventory slot goes in one throw only when all of it is requested.
+                int button = before <= count - dropped ? 1 : 0;
+                mod.getSlotHandler().clickSlot(source, button, net.minecraft.screen.slot.SlotActionType.THROW);
+                dropped += before - StorageHelper.getItemStackInSlot(source).getCount();
+                actions++;
+            }
+            return null;
+        }
+        @Override public boolean isFinished() { return dropped >= count || playerGone; }
+        @Override protected void onStop(Task interrupt) { mod.getBehaviour().pop(); }
+        @Override protected boolean isEqual(Task other) { return this == other; }
+        @Override protected String toDebugString() { return "IO drop held " + item; }
     }
 
     private BlockPos nearestPortal() {
