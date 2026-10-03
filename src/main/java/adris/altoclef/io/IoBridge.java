@@ -316,7 +316,8 @@ public final class IoBridge {
                 case "prim.use" -> startEat(callId,args);
                 case "prim.sleep" -> startSleep(callId,args);
                 case "prim.activate" -> {
-                    if ("use_door".equals(args.path("interaction").asText())) startDoor(callId,args);
+                    if ("clear_furnace".equals(args.path("interaction").asText())) startClearFurnace(callId,args);
+                    else if ("use_door".equals(args.path("interaction").asText())) startDoor(callId,args);
                     else if ("withdraw".equals(args.path("interaction").asText())) startContainerTransfer(callId, args, false);
                     else startObserveContainer(callId, args);
                 }
@@ -424,7 +425,8 @@ public final class IoBridge {
                 value.put("skyLight",mod.getWorld().getLightLevel(net.minecraft.world.LightType.SKY,pos));
             }
         } else if ("query.container".equals(op)) {
-            var observed = containerSnapshot(args.has("pos") ? readPosition(args.path("pos")) : null);
+            var expected=args.has("pos") ? readPosition(args.path("pos")) : null;
+            var observed = "furnace".equals(args.path("kind").asText()) ? screenSnapshot(expected,true) : containerSnapshot(expected);
             if (observed == null) { result(callId,"failed","container_not_open",null); return; }
             value = observed;
         } else if ("query.entities".equals(op)) {
@@ -458,9 +460,12 @@ public final class IoBridge {
                 || name.endsWith("_shulker_box");
     }
 
-    private ObjectNode containerSnapshot(BlockPos expected) {
+    private boolean furnace(String name) { return java.util.Set.of("furnace","blast_furnace","smoker").contains(name); }
+    private ObjectNode containerSnapshot(BlockPos expected) { return screenSnapshot(expected,false); }
+    private ObjectNode screenSnapshot(BlockPos expected,boolean furnace) {
         var handler = mod.getPlayer().currentScreenHandler;
-        if (!(handler instanceof net.minecraft.screen.GenericContainerScreenHandler)
+        if (furnace) { if (!(handler instanceof net.minecraft.screen.AbstractFurnaceScreenHandler)) return null; }
+        else if (!(handler instanceof net.minecraft.screen.GenericContainerScreenHandler)
                 && !(handler instanceof net.minecraft.screen.ShulkerBoxScreenHandler)) return null;
         if (syncedInventoryHandler != handler) return null;
         var last = mod.getItemStorage().getLastBlockPosInteraction();
@@ -468,7 +473,7 @@ public final class IoBridge {
         BlockPos pos = last.get();
         if (!isLoaded(pos)) return null;
         String name = Registries.BLOCK.getId(mod.getWorld().getBlockState(pos).getBlock()).getPath();
-        if (!storageContainer(name)) return null;
+        if (furnace ? !furnace(name) : !storageContainer(name)) return null;
         int slots = handler.slots.size() - 36, used = 0;
         ObjectNode value = json.createObjectNode().put("container", name).put("dimension", mod.getWorld().getRegistryKey().getValue().toString());
         value.putObject("position").put("x",pos.getX()).put("y",pos.getY()).put("z",pos.getZ());
@@ -482,6 +487,68 @@ public final class IoBridge {
         }
         value.put("emptySlots", slots-used);
         return value;
+    }
+
+    private void startClearFurnace(String callId,JsonNode args) {
+        BlockPos pos=readPosition(args.path("pos"));
+        if (!isLoaded(pos)) { result(callId,"failed","no_furnace",null); return; }
+        String name=Registries.BLOCK.getId(mod.getWorld().getBlockState(pos).getBlock()).getPath();
+        if (!furnace(name)) { result(callId,"failed","no_furnace",null); return; }
+        var task=new IoClearFurnaceTask(pos,name);
+        beginTask(callId,task,() -> result(callId,task.failure==null ? "ok" : "failed",task.failure,task.value()),task::value);
+    }
+    private final class IoClearFurnaceTask extends Task implements ITaskRequiresGrounded {
+        private final BlockPos pos;
+        private final String name;
+        private final Task interact;
+        private final java.util.Map<String,Integer> gains=new java.util.HashMap<>();
+        private net.minecraft.screen.ScreenHandler handler;
+        private ObjectNode observed;
+        private String pending,failure;
+        private int pendingBefore,taken;
+        private long clicked;
+        private boolean done;
+        IoClearFurnaceTask(BlockPos pos,String name) { this.pos=pos; this.name=name; interact=new adris.altoclef.tasks.InteractWithBlockTask(pos); }
+        ObjectNode value() {
+            int extra=pending==null ? 0 : Math.max(0,countOf(pending)-pendingBefore);
+            ObjectNode value=json.createObjectNode().put("taken",taken+extra);
+            value.putObject("at").put("x",pos.getX()).put("y",pos.getY()).put("z",pos.getZ());
+            ObjectNode amounts=value.putObject("gains"); gains.forEach(amounts::put);
+            if (extra>0) amounts.put(pending,gains.getOrDefault(pending,0)+extra);
+            if (observed!=null) value.set("observation",observed.deepCopy());
+            return value;
+        }
+        @Override protected void onStart() { StorageHelper.closeScreen(); syncedInventoryHandler=null; mod.getBehaviour().push(); }
+        @Override protected Task onTick() {
+            if (!isLoaded(pos) || !Registries.BLOCK.getId(mod.getWorld().getBlockState(pos).getBlock()).getPath().equals(name)) {
+                failure="no_furnace"; done=true; return null;
+            }
+            if (handler==null) {
+                if (screenSnapshot(pos,true)==null) return interact;
+                handler=mod.getPlayer().currentScreenHandler;
+            }
+            if (mod.getPlayer().currentScreenHandler!=handler) { failure="furnace_not_empty"; done=true; return null; }
+            if (pending!=null) {
+                if (System.currentTimeMillis()-clicked<400) return null;
+                int gained=countOf(pending)-pendingBefore;
+                if (gained<=0) { failure="furnace_not_empty"; observed=screenSnapshot(pos,true); done=true; return null; }
+                gains.merge(pending,gained,Integer::sum); taken+=gained; pending=null;
+            }
+            if (!mod.getSlotHandler().canDoSlotAction()) return null;
+            for (int i=0;i<3;i++) {
+                ItemStack stack=handler.getSlot(i).getStack();
+                if (stack.isEmpty()) continue;
+                mod.getBehaviour().addProtectedItems(stack.getItem());
+                pending=Registries.ITEM.getId(stack.getItem()).getPath(); pendingBefore=countOf(pending);
+                mod.getController().clickSlot(handler.syncId,i,0,net.minecraft.screen.slot.SlotActionType.QUICK_MOVE,mod.getPlayer());
+                mod.getSlotHandler().registerSlotAction(); clicked=System.currentTimeMillis(); return null;
+            }
+            observed=screenSnapshot(pos,true); done=true; return null;
+        }
+        @Override public boolean isFinished() { return done; }
+        @Override protected void onStop(Task interrupt) { StorageHelper.closeScreen(); mod.getBehaviour().pop(); }
+        @Override protected boolean isEqual(Task other) { return this==other; }
+        @Override protected String toDebugString() { return "IO recover furnace contents " + pos; }
     }
 
     private void startDoor(String callId, JsonNode args) {
@@ -983,13 +1050,14 @@ public final class IoBridge {
     }
 
     private void startObserveContainer(String callId, JsonNode args) {
-        if (!"observe_container".equals(args.path("interaction").asText()))
+        boolean furnace="observe_furnace".equals(args.path("interaction").asText());
+        if (!furnace && !"observe_container".equals(args.path("interaction").asText()))
             throw new IllegalArgumentException("unsupported activation");
         BlockPos pos = readPosition(args.path("pos"));
         if (!isLoaded(pos)) { result(callId,"failed","container_not_found",null); return; }
         String name = Registries.BLOCK.getId(mod.getWorld().getBlockState(pos).getBlock()).getPath();
-        if (!storageContainer(name)) { result(callId,"failed","not_a_container",null); return; }
-        var task = new IoObserveContainerTask(pos, name);
+        if (furnace ? !furnace(name) : !storageContainer(name)) { result(callId,"failed",furnace ? "no_furnace" : "not_a_container",null); return; }
+        var task = new IoObserveContainerTask(pos, name, furnace);
         beginTask(callId,task,() -> result(callId,task.failure == null ? "ok" : "failed",task.failure,task.observed),
                 () -> task.observed == null ? json.createObjectNode() : task.observed.deepCopy());
     }
@@ -997,11 +1065,12 @@ public final class IoBridge {
     private final class IoObserveContainerTask extends Task implements ITaskRequiresGrounded {
         private final BlockPos pos;
         private final String name;
+        private final boolean furnace;
         private final Task interact;
         private String failure;
         private ObjectNode observed;
-        IoObserveContainerTask(BlockPos pos, String name) {
-            this.pos=pos; this.name=name;
+        IoObserveContainerTask(BlockPos pos, String name, boolean furnace) {
+            this.pos=pos; this.name=name; this.furnace=furnace;
             interact=new adris.altoclef.tasks.InteractWithBlockTask(pos);
         }
         @Override protected void onStart() { StorageHelper.closeScreen(); syncedInventoryHandler=null; }
@@ -1010,7 +1079,7 @@ public final class IoBridge {
             if (!Registries.BLOCK.getId(mod.getWorld().getBlockState(pos).getBlock()).getPath().equals(name)) {
                 failure="not_a_container"; return null;
             }
-            observed=containerSnapshot(pos);
+            observed=screenSnapshot(pos,furnace);
             if (observed != null) return null;
             return interact;
         }
