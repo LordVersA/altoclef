@@ -1019,7 +1019,16 @@ public final class IoBridge {
                 throw new IllegalArgumentException("invalid pickup names");
             for (var name:args.path("names")) names.add(name.asText());
         }
-        var task=new IoPickupTask(radius,names);
+        net.minecraft.util.math.Vec3d near=null;
+        if (args.has("near")) {
+            var p=args.path("near");
+            if (!p.path("x").isNumber() || !p.path("y").isNumber() || !p.path("z").isNumber()) throw new IllegalArgumentException("invalid pickup centre");
+            near=new net.minecraft.util.math.Vec3d(p.path("x").asDouble(),p.path("y").asDouble(),p.path("z").asDouble());
+            if (!Double.isFinite(near.x) || !Double.isFinite(near.y) || !Double.isFinite(near.z) || Math.abs(near.x)>30000000 || Math.abs(near.z)>30000000 || near.y< -64 || near.y>320) throw new IllegalArgumentException("invalid pickup centre");
+        }
+        boolean approach=args.path("approach").asBoolean(false);
+        if (approach && near==null) throw new IllegalArgumentException("approach needs a pickup centre");
+        var task=new IoPickupTask(radius,names,near,approach);
         beginTask(callId,task,() -> result(callId,task.failure==null ? "ok" : "failed",task.failure,task.value()),task::value);
     }
 
@@ -1034,10 +1043,15 @@ public final class IoBridge {
         private net.minecraft.util.math.Vec3d centre;
         private net.minecraft.entity.ItemEntity active;
         private Task movement;
-        private long started,targetStarted;
-        private boolean done;
+        private long started,targetStarted,approachStarted;
+        private boolean done,approaching,oldBreak,oldPlace;
+        private final net.minecraft.util.math.Vec3d requestedCentre;
+        private final Task approachTask;
         private String failure;
-        IoPickupTask(int radius,java.util.Set<String> names) { this.radius=radius; this.names=names; }
+        IoPickupTask(int radius,java.util.Set<String> names,net.minecraft.util.math.Vec3d near,boolean approach) {
+            this.radius=radius; this.names=names; requestedCentre=near; approaching=approach;
+            approachTask=approach ? new GetToBlockTask(BlockPos.ofFloored(near),false) : null;
+        }
         private java.util.Map<String,Integer> inventory() {
             java.util.Map<String,Integer> counts=new java.util.HashMap<>();
             for (int i=0;i<36;i++) {
@@ -1071,19 +1085,36 @@ public final class IoBridge {
             ObjectNode counts=value.putObject("inventoryBefore"); before.forEach(counts::put);
             return value;
         }
-        @Override protected void onStart() {
-            centre=mod.getPlayer().getPos(); started=System.currentTimeMillis(); before.putAll(inventory());
+        private void scanDrops() {
             for (var entity:mod.getEntityTracker().getDroppedItems()) {
                 String name=Registries.ITEM.getId(entity.getStack().getItem()).getPath();
-                if (entity.isAlive() && entity.squaredDistanceTo(centre)<=radius*radius && (names.isEmpty() || names.contains(name))) {
+                if (entity.isAlive() && !kinds.containsKey(entity.getId()) && entity.squaredDistanceTo(centre)<=radius*radius && (names.isEmpty() || names.contains(name))) {
                     seen.add(entity); amounts.put(entity.getId(),entity.getStack().getCount()); kinds.put(entity.getId(),name);
+                    mod.getBehaviour().addProtectedItems(entity.getStack().getItem());
                 }
             }
+        }
+        @Override protected void onStart() {
+            centre=requestedCentre==null ? mod.getPlayer().getPos() : requestedCentre;
+            started=System.currentTimeMillis(); approachStarted=started; before.putAll(inventory());
             mod.getBehaviour().push();
-            for (var entity:seen) mod.getBehaviour().addProtectedItems(entity.getStack().getItem());
+            if (approachTask!=null) {
+                var settings=mod.getClientBaritoneSettings(); oldBreak=settings.allowBreak.value; oldPlace=settings.allowPlace.value;
+                settings.allowBreak.value=false; settings.allowPlace.value=false; mod.getBehaviour().avoidBlockBreaking(p->true);
+            }
+            scanDrops();
         }
         @Override protected Task onTick() {
             long now=System.currentTimeMillis();
+            if (approaching) {
+                // Observe drops while approaching so pickups during the walk still count.
+                scanDrops();
+                if (mod.getPlayer().squaredDistanceTo(centre)>9) {
+                    if (now-approachStarted>180000) { failure="death_site_unreachable"; done=true; return null; }
+                    return approachTask;
+                }
+                approaching=false; started=now;
+            }
             if (active!=null && (!active.isAlive() || active.squaredDistanceTo(centre)>radius*radius || now-targetStarted>8000)) {
                 skipped.add(active.getId()); active=null; movement=null;
             }
@@ -1100,7 +1131,12 @@ public final class IoBridge {
             return movement;
         }
         @Override public boolean isFinished() { return done; }
-        @Override protected void onStop(Task interrupt) { mod.getBehaviour().pop(); }
+        @Override protected void onStop(Task interrupt) {
+            mod.getBehaviour().pop(); mod.getClientBaritone().getPathingBehavior().forceCancel();
+            if (approachTask!=null) {
+                mod.getClientBaritoneSettings().allowBreak.value=oldBreak; mod.getClientBaritoneSettings().allowPlace.value=oldPlace;
+            }
+        }
         @Override protected boolean isEqual(Task other) { return this==other; }
         @Override protected String toDebugString() { return "IO pick up existing drops"; }
     }
