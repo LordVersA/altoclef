@@ -321,7 +321,8 @@ public final class IoBridge {
                 }
                 case "prim.sleep" -> startSleep(callId,args);
                 case "prim.activate" -> {
-                    if ("flee_from".equals(args.path("interaction").asText())) startFlee(callId,args);
+                    if ("attack_entity".equals(args.path("interaction").asText())) startAttack(callId,args);
+                    else if ("flee_from".equals(args.path("interaction").asText())) startFlee(callId,args);
                     else if ("escape_liquid".equals(args.path("interaction").asText())) startEscapeLiquid(callId,args);
                     else if ("clear_furnace".equals(args.path("interaction").asText())) startClearFurnace(callId,args);
                     else if ("use_door".equals(args.path("interaction").asText())) startDoor(callId,args);
@@ -444,6 +445,8 @@ public final class IoBridge {
                 ObjectNode entry = entities.addObject();
                 entry.put("id", String.valueOf(entity.getId()));
                 entry.put("uuid",entity.getUuid().toString()); entry.put("alive",entity.isAlive());
+                entry.put("living",entity instanceof net.minecraft.entity.LivingEntity);
+                if (entity instanceof net.minecraft.entity.LivingEntity living) entry.put("health",living.getHealth());
                 entry.put("hostile",entity instanceof net.minecraft.entity.mob.HostileEntity || entity instanceof net.minecraft.entity.mob.SlimeEntity || entity instanceof net.minecraft.entity.mob.PhantomEntity);
                 if (entity instanceof net.minecraft.entity.passive.SheepEntity sheep) entry.put("sheared",sheep.isSheared());
                 if (entity instanceof net.minecraft.entity.player.PlayerEntity player) {
@@ -499,6 +502,57 @@ public final class IoBridge {
         }
         value.put("emptySlots", slots-used);
         return value;
+    }
+
+    private void startAttack(String callId,JsonNode args) {
+        int id=args.path("entityId").asInt(-1); UUID uuid=UUID.fromString(args.path("entityUuid").asText());
+        double threshold=args.path("retreatBelowHealth").asDouble(6);
+        if (!Double.isFinite(threshold) || threshold<0 || threshold>20) throw new IllegalArgumentException("invalid health threshold");
+        var entity=mod.getWorld().getEntityById(id);
+        if (!(entity instanceof net.minecraft.entity.LivingEntity living) || entity==mod.getPlayer() || !entity.isAlive() || !entity.getUuid().equals(uuid)) { result(callId,"failed","target_not_found",null); return; }
+        net.minecraft.item.Item weapon=null; float rank=Float.NEGATIVE_INFINITY;
+        for (int i=0;i<36;i++) {
+            var item=mod.getPlayer().getInventory().getStack(i).getItem();
+            float score;
+            if (item instanceof net.minecraft.item.SwordItem sword) score=100+sword.getMaterial().getAttackDamage();
+            else if (item instanceof net.minecraft.item.AxeItem axe) score=axe.getMaterial().getAttackDamage();
+            else continue;
+            if (score>rank) { rank=score; weapon=item; }
+        }
+        if (weapon==null) { result(callId,"failed","no_weapon",null); return; }
+        var task=new IoAttackTask(living,threshold,weapon);
+        beginTask(callId,task,()->result(callId,task.failure==null ? "ok" : "failed",task.failure,task.value()),task::value);
+    }
+    private final class IoAttackTask extends Task implements ITaskRequiresGrounded {
+        private final net.minecraft.entity.LivingEntity entity;
+        private final double threshold;
+        private final Task kill,equip;
+        private final net.minecraft.item.Item weapon;
+        private long started;
+        private boolean done,killed,oldBreak,oldPlace;
+        private String failure;
+        IoAttackTask(net.minecraft.entity.LivingEntity entity,double threshold,net.minecraft.item.Item weapon) { this.entity=entity; this.threshold=threshold; this.weapon=weapon; equip=new IoEquipTask(weapon,net.minecraft.entity.EquipmentSlot.MAINHAND); kill=new adris.altoclef.tasks.entity.KillEntityTask(entity); }
+        ObjectNode value() { return json.createObjectNode().put("entityId",entity.getId()).put("entityUuid",entity.getUuid().toString()).put("killed",killed).put("healthRemaining",mod.getPlayer().getHealth()); }
+        @Override protected void onStart() {
+            started=System.currentTimeMillis(); mod.getBehaviour().push(); mod.getBehaviour().avoidBlockBreaking(p->true);
+            var settings=mod.getClientBaritoneSettings(); oldBreak=settings.allowBreak.value; oldPlace=settings.allowPlace.value;
+            settings.allowBreak.value=false; settings.allowPlace.value=false;
+        }
+        @Override protected Task onTick() {
+            if (entity.getHealth()<=0) { killed=true; done=true; return null; }
+            if (mod.getPlayer().getHealth()<=threshold) { failure="health_too_low"; done=true; return null; }
+            if (mod.getWorld().getEntityById(entity.getId())!=entity || !entity.isAlive()) { failure="target_not_found"; done=true; return null; }
+            if (System.currentTimeMillis()-started>170000) { failure="target_unreachable"; done=true; return null; }
+            if (mod.getPlayer().getMainHandStack().getItem()!=weapon) return equip;
+            return kill;
+        }
+        @Override public boolean isFinished() { return done; }
+        @Override protected void onStop(Task interrupt) {
+            mod.getClientBaritone().getPathingBehavior().forceCancel(); mod.getBehaviour().pop();
+            mod.getClientBaritoneSettings().allowBreak.value=oldBreak; mod.getClientBaritoneSettings().allowPlace.value=oldPlace;
+        }
+        @Override protected boolean isEqual(Task other) { return this==other; }
+        @Override protected String toDebugString() { return "IO attack exact living entity"; }
     }
 
     private void startFlee(String callId,JsonNode args) {
