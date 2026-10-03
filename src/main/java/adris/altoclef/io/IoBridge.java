@@ -1542,14 +1542,18 @@ public final class IoBridge {
         @Override protected String toDebugString() { return "IO place " + pos; }
     }
 
-    private String digRefusal(BlockPos pos, String expected, boolean allowLiquid) {
+    private String digRefusal(BlockPos pos, String expected, boolean allowLiquid, boolean allowUp) {
         if (!isLoaded(pos)) return "not_loaded";
         var state = mod.getWorld().getBlockState(pos);
         if (state.isAir() || !state.getFluidState().isEmpty()) return null;
         if (!Registries.BLOCK.getId(state.getBlock()).getPath().equals(expected)) return "unexpected_block";
         var feet = mod.getPlayer().getBlockPos();
         if (pos.getX() == feet.getX() && pos.getZ() == feet.getZ()
-                && (pos.getY() < feet.getY() || pos.getY() >= feet.getY() + 2)) return "unsafe_dig";
+                && (pos.getY() < feet.getY() || pos.getY() >= feet.getY() + 2)) {
+            if (!allowUp || pos.getY()!=feet.getY()+2 || !isLoaded(pos.up())
+                    || mod.getWorld().getBlockState(pos.up()).getBlock() instanceof net.minecraft.block.FallingBlock)
+                return "unsafe_dig";
+        }
         for (var direction : net.minecraft.util.math.Direction.values()) {
             var neighbour = pos.offset(direction);
             if (!isLoaded(neighbour)) return "not_loaded";
@@ -1569,7 +1573,7 @@ public final class IoBridge {
         BlockPos pos = readPosition(args.path("pos"));
         String expected = args.path("expectedBlock").asText();
         if (!expected.matches("[a-z0-9_]{1,128}")) throw new IllegalArgumentException("invalid expected block");
-        var task = new IoDigTask(pos, expected, args.path("collect").asBoolean(true), args.path("allowLiquid").asBoolean(false), args.path("ripeOnly").asBoolean(false));
+        var task = new IoDigTask(pos, expected, args.path("collect").asBoolean(true), args.path("allowLiquid").asBoolean(false), args.path("ripeOnly").asBoolean(false), args.path("allowUp").asBoolean(false));
         PartialSupplier observed = () -> {
             ObjectNode value = json.createObjectNode().put("block", expected);
             value.putObject("pos").put("x", pos.getX()).put("y", pos.getY()).put("z", pos.getZ());
@@ -1583,12 +1587,12 @@ public final class IoBridge {
         private final String expected;
         private final boolean collect;
         private final boolean allowLiquid;
-        private final boolean ripeOnly;
+        private final boolean ripeOnly,allowUp;
         private final Task destroy;
         private String failure;
         private long brokenAt;
-        IoDigTask(BlockPos pos, String expected, boolean collect, boolean allowLiquid, boolean ripeOnly) {
-            this.pos = pos; this.expected = expected; this.collect = collect; this.allowLiquid = allowLiquid; this.ripeOnly = ripeOnly;
+        IoDigTask(BlockPos pos, String expected, boolean collect, boolean allowLiquid, boolean ripeOnly, boolean allowUp) {
+            this.pos = pos; this.expected = expected; this.collect = collect; this.allowLiquid = allowLiquid; this.ripeOnly = ripeOnly; this.allowUp = allowUp;
             destroy = new adris.altoclef.tasks.construction.DestroyBlockTask(pos);
         }
         private boolean gone() {
@@ -1601,7 +1605,7 @@ public final class IoBridge {
         }
         @Override protected void onStart() { }
         @Override protected Task onTick() {
-            failure = digRefusal(pos, expected, allowLiquid);
+            failure = digRefusal(pos, expected, allowLiquid, allowUp);
             if (failure == null && ripeOnly && !gone()) {
                 var state = mod.getWorld().getBlockState(pos);
                 if (!(state.getBlock() instanceof net.minecraft.block.CropBlock crop) || !crop.isMature(state)) failure = "nothing_ripe";
@@ -1778,6 +1782,12 @@ public final class IoBridge {
         int z = args.path("z").asInt();
         boolean hasY = args.has("y");
         int y = args.path("y").asInt();
+        if (args.path("walkingOnly").asBoolean(false)) {
+            if (!hasY) throw new IllegalArgumentException("walking step requires y");
+            var walk=new IoWalkStepTask(new BlockPos(x,y,z));
+            beginTask(callId,walk,()->result(callId,walk.failure==null ? "ok" : "failed",walk.failure,json.createObjectNode()),()->json.createObjectNode());
+            return;
+        }
         Task task = hasY ? new GetToBlockTask(new BlockPos(x, y, z)) : new GetToXZTask(x, z);
         beginTask(callId, task, () -> {
             ClientPlayerEntity player = MinecraftClient.getInstance().player;
@@ -1790,6 +1800,36 @@ public final class IoBridge {
             if (dist <= 3.0) result(callId, "ok", null, value);
             else result(callId, "failed", "not_arrived", value);
         }, () -> json.createObjectNode());
+    }
+
+    private final class IoWalkStepTask extends Task implements ITaskRequiresGrounded {
+        private final BlockPos pos;
+        private long started;
+        private boolean done,oldBreak,oldPlace,oldParkour;
+        private int oldFall;
+        private String failure;
+        IoWalkStepTask(BlockPos pos) { this.pos=pos; }
+        @Override protected void onStart() {
+            started=System.currentTimeMillis(); mod.getBehaviour().push(); mod.getBehaviour().avoidBlockBreaking(p->true);
+            var settings=mod.getClientBaritoneSettings(); oldBreak=settings.allowBreak.value; oldPlace=settings.allowPlace.value;
+            oldParkour=settings.allowParkour.value; oldFall=settings.maxFallHeightNoWater.value;
+            settings.allowBreak.value=false; settings.allowPlace.value=false; settings.allowParkour.value=false; settings.maxFallHeightNoWater.value=3;
+            mod.getClientBaritone().getPathingBehavior().forceCancel();
+        }
+        @Override protected Task onTick() {
+            if (mod.getPlayer().isOnGround() && mod.getPlayer().getBlockPos().equals(pos)) { done=true; return null; }
+            if (System.currentTimeMillis()-started>10000) { failure="target_unreachable"; done=true; return null; }
+            if (!mod.getClientBaritone().getCustomGoalProcess().isActive()) mod.getClientBaritone().getCustomGoalProcess().setGoalAndPath(new baritone.api.pathing.goals.GoalBlock(pos));
+            return null;
+        }
+        @Override public boolean isFinished() { return done; }
+        @Override protected void onStop(Task interrupt) {
+            mod.getClientBaritone().getPathingBehavior().forceCancel(); mod.getBehaviour().pop();
+            var settings=mod.getClientBaritoneSettings(); settings.allowBreak.value=oldBreak; settings.allowPlace.value=oldPlace;
+            settings.allowParkour.value=oldParkour; settings.maxFallHeightNoWater.value=oldFall;
+        }
+        @Override protected boolean isEqual(Task other) { return this==other; }
+        @Override protected String toDebugString() { return "IO walk without terrain edits"; }
     }
 
     /** count is inventory hunger units, as in AltoClef's @food command. */
