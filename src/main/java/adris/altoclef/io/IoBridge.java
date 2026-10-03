@@ -7,7 +7,16 @@ import adris.altoclef.eventbus.events.ChatMessageEvent;
 import adris.altoclef.eventbus.events.ClientTickEvent;
 import adris.altoclef.tasks.movement.GetToBlockTask;
 import adris.altoclef.tasks.movement.GetToXZTask;
+import adris.altoclef.tasks.movement.FollowPlayerTask;
+import adris.altoclef.tasks.movement.DefaultGoToDimensionTask;
+import adris.altoclef.tasks.entity.GiveItemToPlayerTask;
+import adris.altoclef.tasks.resources.CollectFoodTask;
+import adris.altoclef.tasks.construction.compound.ConstructNetherPortalBucketTask;
 import adris.altoclef.tasksystem.Task;
+import adris.altoclef.util.Dimension;
+import adris.altoclef.util.ItemTarget;
+import adris.altoclef.util.helpers.StorageHelper;
+import adris.altoclef.util.helpers.WorldHelper;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -15,6 +24,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.PlayerListEntry;
 import net.minecraft.client.network.ClientPlayerEntity;
+import net.minecraft.block.Blocks;
 import net.minecraft.item.ItemStack;
 import net.minecraft.registry.Registries;
 import net.minecraft.util.math.BlockPos;
@@ -217,6 +227,8 @@ public final class IoBridge {
                 coreSession = p.path("coreSession").asText();
                 welcomed = true;
                 log("welcomed by Core session " + coreSession);
+                // A new Core connection needs a snapshot even if the player has not moved.
+                MinecraftClient.getInstance().execute(() -> pushState(true));
             }
             case "ping" -> {
                 ObjectNode pong = json.createObjectNode();
@@ -260,6 +272,10 @@ public final class IoBridge {
             switch (op) {
                 case "task.get" -> startGet(callId, args.path("item").asText(), args.path("count").asInt(1));
                 case "task.goto" -> startGoto(callId, args);
+                case "task.food" -> startFood(callId, args.path("count").asInt(20));
+                case "task.follow" -> startFollow(callId, args.path("player").asText());
+                case "task.give" -> startGive(callId, args);
+                case "task.portal" -> startPortal(callId, args.path("enter").asBoolean(false));
                 default -> result(callId, "failed", "unsupported_op", null);
             }
         } catch (Exception e) {
@@ -306,6 +322,103 @@ public final class IoBridge {
             if (dist <= 3.0) result(callId, "ok", null, value);
             else result(callId, "failed", "not_arrived", value);
         }, () -> json.createObjectNode());
+    }
+
+    /** count is inventory hunger units, as in AltoClef's @food command. */
+    private void startFood(String callId, int count) {
+        if (count <= 0 || count > 10000) throw new IllegalArgumentException("invalid food count");
+        PartialSupplier food = () -> {
+            ObjectNode value = json.createObjectNode();
+            value.put("foodUnits", StorageHelper.calculateInventoryFoodScore());
+            return value;
+        };
+        beginTask(callId, new CollectFoodTask(count), () -> {
+            ObjectNode value = food.get();
+            result(callId, value.path("foodUnits").asInt() >= count ? "ok" : "failed", null, value);
+        }, food);
+    }
+
+    private ObjectNode playerDistance(String player) {
+        ObjectNode value = json.createObjectNode();
+        value.put("player", player);
+        var target = mod.getEntityTracker().getPlayerEntity(player);
+        if (target.isPresent()) value.put("distance", target.get().distanceTo(mod.getPlayer()));
+        else value.putNull("distance");
+        return value;
+    }
+
+    /** Following is continuous; Core cancels it after independently checking the follower. */
+    private void startFollow(String callId, String player) {
+        if (!player.matches("[A-Za-z0-9_]{1,16}")) throw new IllegalArgumentException("invalid player");
+        beginTask(callId, new FollowPlayerTask(player),
+                () -> result(callId, "failed", "follow_ended", playerDistance(player)),
+                () -> playerDistance(player));
+    }
+
+    /** The result reports dropped items; the operator must independently verify pickup. */
+    private void startGive(String callId, JsonNode args) {
+        String player = args.path("player").asText();
+        String item = args.path("item").asText();
+        int count = args.path("count").asInt(1);
+        if (!player.matches("[A-Za-z0-9_]{1,16}") || count <= 0 || count > 2304) {
+            throw new IllegalArgumentException("invalid give arguments");
+        }
+        if (!TaskCatalogue.taskExists(item)) {
+            result(callId, "failed", "unknown_item", null);
+            return;
+        }
+        int before = countOf(item);
+        GiveItemToPlayerTask task = new GiveItemToPlayerTask(player, new ItemTarget(item, count));
+        beginTask(callId, task, () -> {
+            ObjectNode value = json.createObjectNode();
+            value.put("player", player);
+            value.put("item", item);
+            value.put("remaining", countOf(item));
+            value.put("inventoryDecrease", before - countOf(item));
+            value.put("dropped", task.getDroppedCount());
+            result(callId, task.getDroppedCount() == count ? "ok" : "failed",
+                    task.getDroppedCount() == count ? null : "give_incomplete", value);
+        }, () -> {
+            ObjectNode value = playerDistance(player);
+            value.put("remaining", countOf(item));
+            return value;
+        });
+    }
+
+    private BlockPos nearestPortal() {
+        var portal = mod.getBlockScanner().getNearestBlock(Blocks.NETHER_PORTAL);
+        if (portal.isEmpty() || !portal.get().isWithinDistance(mod.getPlayer().getPos(), 32)) return null;
+        return mod.getWorld().getBlockState(portal.get()).getBlock() == Blocks.NETHER_PORTAL ? portal.get() : null;
+    }
+
+    /** BUILD_PORTAL_VANILLA uses the bucket task; enter=true also crosses into the Nether. */
+    private void startPortal(String callId, boolean enter) {
+        if (WorldHelper.getCurrentDimension() != Dimension.OVERWORLD) {
+            result(callId, "failed", "start_in_overworld", null);
+            return;
+        }
+        Task task = enter ? new DefaultGoToDimensionTask(Dimension.NETHER) : new ConstructNetherPortalBucketTask() {
+            @Override
+            public boolean isFinished() {
+                return nearestPortal() != null;
+            }
+        };
+        PartialSupplier observed = () -> {
+            ObjectNode value = json.createObjectNode();
+            value.put("dimension", WorldHelper.getCurrentDimension().toString());
+            BlockPos portal = nearestPortal();
+            if (portal != null) {
+                ObjectNode pos = value.putObject("portal");
+                pos.put("x", portal.getX());
+                pos.put("y", portal.getY());
+                pos.put("z", portal.getZ());
+            }
+            return value;
+        };
+        beginTask(callId, task, () -> {
+            boolean success = enter ? WorldHelper.getCurrentDimension() == Dimension.NETHER : nearestPortal() != null;
+            result(callId, success ? "ok" : "failed", success ? null : "portal_incomplete", observed.get());
+        }, observed);
     }
 
     private interface PartialSupplier {
