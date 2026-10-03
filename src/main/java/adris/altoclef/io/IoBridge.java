@@ -305,7 +305,8 @@ public final class IoBridge {
         try {
             switch (op) {
                 case "task.get" -> {
-                    if (args.has("smeltInput")) startSmelt(callId, args);
+                    if (args.path("droppedOnly").asBoolean(false)) startPickup(callId, args);
+                    else if (args.has("smeltInput")) startSmelt(callId, args);
                     else startGet(callId, args.path("item").asText(), args.path("count").asInt(1), args.path("additional").asBoolean(false));
                 }
                 case "task.goto" -> startGoto(callId, args);
@@ -462,6 +463,101 @@ public final class IoBridge {
         }
         value.put("emptySlots", slots-used);
         return value;
+    }
+
+    private void startPickup(String callId, JsonNode args) {
+        int radius=args.path("radius").asInt(8);
+        if (radius<1 || radius>32) throw new IllegalArgumentException("invalid pickup radius");
+        java.util.Set<String> names=new java.util.HashSet<>();
+        if (args.has("names")) {
+            if (!args.path("names").isArray() || args.path("names").isEmpty() || args.path("names").size()>16)
+                throw new IllegalArgumentException("invalid pickup names");
+            for (var name:args.path("names")) names.add(name.asText());
+        }
+        var task=new IoPickupTask(radius,names);
+        beginTask(callId,task,() -> result(callId,task.failure==null ? "ok" : "failed",task.failure,task.value()),task::value);
+    }
+
+    private final class IoPickupTask extends Task implements ITaskRequiresGrounded {
+        private final int radius;
+        private final java.util.Set<String> names;
+        private final java.util.Map<String,Integer> before=new java.util.HashMap<>();
+        private final java.util.List<net.minecraft.entity.ItemEntity> seen=new java.util.ArrayList<>();
+        private final java.util.Map<Integer,Integer> amounts=new java.util.HashMap<>();
+        private final java.util.Map<Integer,String> kinds=new java.util.HashMap<>();
+        private final java.util.Set<Integer> skipped=new java.util.HashSet<>();
+        private net.minecraft.util.math.Vec3d centre;
+        private net.minecraft.entity.ItemEntity active;
+        private Task movement;
+        private long started,targetStarted;
+        private boolean done;
+        private String failure;
+        IoPickupTask(int radius,java.util.Set<String> names) { this.radius=radius; this.names=names; }
+        private java.util.Map<String,Integer> inventory() {
+            java.util.Map<String,Integer> counts=new java.util.HashMap<>();
+            for (int i=0;i<36;i++) {
+                ItemStack stack=mod.getPlayer().getInventory().getStack(i);
+                if (!stack.isEmpty()) counts.merge(Registries.ITEM.getId(stack.getItem()).getPath(),stack.getCount(),Integer::sum);
+            }
+            return counts;
+        }
+        private boolean room(ItemStack item) {
+            for (int i=0;i<36;i++) {
+                ItemStack held=mod.getPlayer().getInventory().getStack(i);
+                if (held.isEmpty() || (ItemStack.areItemsAndComponentsEqual(held,item) && held.getCount()<held.getMaxCount())) return true;
+            }
+            return false;
+        }
+        private int collected() {
+            var budget=inventory();
+            budget.replaceAll((name,count)->Math.max(0,count-before.getOrDefault(name,0)));
+            int total=0;
+            for (var entity:seen) {
+                String name=kinds.get(entity.getId()); int available=budget.getOrDefault(name,0);
+                int removed=entity.isAlive() ? Math.max(0,amounts.get(entity.getId())-entity.getStack().getCount()) : amounts.get(entity.getId());
+                int gained=Math.min(available,removed);
+                if (gained>0) { total++; budget.put(name,available-gained); }
+            }
+            return total;
+        }
+        ObjectNode value() {
+            ObjectNode value=json.createObjectNode().put("seen",seen.size()).put("collected",collected());
+            if (centre!=null) value.putObject("centre").put("x",centre.x).put("y",centre.y).put("z",centre.z);
+            ObjectNode counts=value.putObject("inventoryBefore"); before.forEach(counts::put);
+            return value;
+        }
+        @Override protected void onStart() {
+            centre=mod.getPlayer().getPos(); started=System.currentTimeMillis(); before.putAll(inventory());
+            for (var entity:mod.getEntityTracker().getDroppedItems()) {
+                String name=Registries.ITEM.getId(entity.getStack().getItem()).getPath();
+                if (entity.isAlive() && entity.squaredDistanceTo(centre)<=radius*radius && (names.isEmpty() || names.contains(name))) {
+                    seen.add(entity); amounts.put(entity.getId(),entity.getStack().getCount()); kinds.put(entity.getId(),name);
+                }
+            }
+            mod.getBehaviour().push();
+            for (var entity:seen) mod.getBehaviour().addProtectedItems(entity.getStack().getItem());
+        }
+        @Override protected Task onTick() {
+            long now=System.currentTimeMillis();
+            if (active!=null && (!active.isAlive() || active.squaredDistanceTo(centre)>radius*radius || now-targetStarted>8000)) {
+                skipped.add(active.getId()); active=null; movement=null;
+            }
+            if (active==null) {
+                active=seen.stream().filter(e->e.isAlive() && !skipped.contains(e.getId()) && e.squaredDistanceTo(centre)<=radius*radius && room(e.getStack()))
+                    .min(java.util.Comparator.comparingDouble(e->e.squaredDistanceTo(mod.getPlayer()))).orElse(null);
+                if (active!=null) { targetStarted=now; movement=new GetToEntityTask(active,0.25); }
+            }
+            if (active==null || now-started>100000) {
+                if (!seen.isEmpty() && collected()==0)
+                    failure=seen.stream().anyMatch(e->e.isAlive()) && seen.stream().filter(e->e.isAlive()).noneMatch(e->room(e.getStack())) ? "inventory_full" : "pickup_failed";
+                done=true; return null;
+            }
+            return movement;
+        }
+        @Override public boolean isFinished() { return done; }
+        @Override protected void onStop(Task interrupt) { mod.getBehaviour().pop(); }
+        @Override protected boolean isEqual(Task other) { return this==other; }
+        @Override protected String toDebugString() { return "IO pick up existing drops"; }
     }
 
     private void startContainerTransfer(String callId, JsonNode args, boolean deposit) {
