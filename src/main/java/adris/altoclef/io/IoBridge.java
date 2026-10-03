@@ -82,6 +82,8 @@ public final class IoBridge {
     public static net.minecraft.item.Item selectedSmeltFuel() { return smeltFuel; }
     private long lastStateAt;
     private String lastStateJson = "";
+    private Boolean lastDead;
+    private boolean enabledForRespawn;
     private final Map<String, JsonNode> finished = new HashMap<>();
 
     public static void start(AltoClef mod) {
@@ -2045,10 +2047,33 @@ public final class IoBridge {
     }
 
     private void tick() {
+        var client=MinecraftClient.getInstance();
+        boolean needsRespawn=client.player!=null && client.world!=null && client.player.getHealth()<=0;
+        if (welcomed && needsRespawn && mod.getModSettings().isAutoRespawn() && !mod.getTaskRunner().isActive()) {
+            mod.getTaskRunner().enable(); enabledForRespawn=true;
+        } else if (enabledForRespawn && (!needsRespawn || !welcomed)) {
+            enabledForRespawn=false;
+            if (runningCallId==null) mod.getTaskRunner().disable();
+        }
         if (runningCallId != null && mod.getPlayer() != null
                 && mod.getPlayer().currentScreenHandler instanceof net.minecraft.screen.CraftingScreenHandler)
             usedCraftingTable = true;
-        if (welcomed) pushState(false);
+        if (welcomed) {
+            var mc=MinecraftClient.getInstance();
+            if (mc.player!=null && mc.world!=null) {
+                boolean dead=mc.player.getHealth()<=0;
+                if ((dead && !Boolean.TRUE.equals(lastDead)) || (!dead && Boolean.TRUE.equals(lastDead))) {
+                    pushState(true);
+                    var event=json.createObjectNode().put("kind",dead ? "death" : "respawn").put("at",Instant.now().toString());
+                    var detail=event.putObject("detail");
+                    detail.putObject("position").put("x",mc.player.getX()).put("y",mc.player.getY()).put("z",mc.player.getZ());
+                    detail.put("dimension",mc.world.getRegistryKey().getValue().toString());
+                    send("body.event",event);
+                }
+                lastDead=dead;
+            }
+            pushState(false);
+        }
     }
 
     private void pushState(boolean force) {
@@ -2062,6 +2087,7 @@ public final class IoBridge {
             p.putNull("dimension");
             p.putNull("health");
             p.putNull("food");
+            p.putNull("saturation");
             p.putArray("inventory");
         } else {
             ObjectNode pos = p.putObject("position");
@@ -2071,6 +2097,7 @@ public final class IoBridge {
             p.put("dimension", mc.world.getRegistryKey().getValue().toString());
             p.put("health", player.getHealth());
             p.put("food", player.getHungerManager().getFoodLevel());
+            p.put("saturation",player.getHungerManager().getSaturationLevel());
             ArrayNode inv = p.putArray("inventory");
             for (Map.Entry<String, Integer> e : inventory(player).entrySet()) {
                 ObjectNode row = inv.addObject();
