@@ -208,6 +208,9 @@ public class AltoClef implements ModInitializer {
 
         getClientBaritone().getGameEventHandler().registerEventListener(new TabCompleter());
 
+        // IO: the bridge to Core, if configured.
+        adris.altoclef.io.IoBridge.start(this);
+
         // External mod initialization
         runEnqueuedPostInits();
     }
