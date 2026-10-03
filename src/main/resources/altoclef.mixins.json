@@ -21,6 +21,7 @@
     "WorldBlockModifiedMixin"
   ],
   "client": [
+    "BuilderMovementMixin",
     "ChatInputMixin",
     "ChatInputSuggestorMixin",
     "ChatReadMixin",

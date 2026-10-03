@@ -12,4 +12,5 @@ Compared with the jar MiranCZ publishes (SHA-256
 is byte-identical; only the `fabric.mod.json` that Loom generates for the nested `nether-pathfinder`
 jar differs.
 
-Rebuild with `scripts/platform/build-body.sh` in the IO repository.
+The pinned inputs and offline AltoClef build command are recorded in
+`docs/reviews/platform-2026-10-03.md` in the outer IO repository.

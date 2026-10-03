@@ -13,6 +13,11 @@ import adris.altoclef.tasks.entity.GiveItemToPlayerTask;
 import adris.altoclef.tasks.resources.CollectFoodTask;
 import adris.altoclef.tasks.construction.compound.ConstructNetherPortalBucketTask;
 import adris.altoclef.tasksystem.Task;
+import adris.altoclef.tasksystem.ITaskRequiresGrounded;
+import baritone.api.BaritoneAPI;
+import baritone.api.schematic.IStaticSchematic;
+import java.io.FileInputStream;
+import java.nio.file.Path;
 import adris.altoclef.util.Dimension;
 import adris.altoclef.util.ItemTarget;
 import adris.altoclef.util.helpers.StorageHelper;
@@ -275,6 +280,8 @@ public final class IoBridge {
                 case "task.food" -> startFood(callId, args.path("count").asInt(20));
                 case "task.follow" -> startFollow(callId, args.path("player").asText());
                 case "task.give" -> startGive(callId, args);
+                case "baritone.clearArea" -> startClearArea(callId, args);
+                case "baritone.build" -> startBuild(callId, args);
                 case "task.portal" -> startPortal(callId, args.path("enter").asBoolean(false));
                 default -> result(callId, "failed", "unsupported_op", null);
             }
@@ -419,6 +426,114 @@ public final class IoBridge {
             boolean success = enter ? WorldHelper.getCurrentDimension() == Dimension.NETHER : nearestPortal() != null;
             result(callId, success ? "ok" : "failed", success ? null : "portal_incomplete", observed.get());
         }, observed);
+    }
+
+    private BlockPos readPosition(JsonNode node) {
+        for (String axis : new String[]{"x", "y", "z"}) {
+            if (!node.path(axis).isIntegralNumber()) throw new IllegalArgumentException("integer position required");
+        }
+        BlockPos pos = new BlockPos(node.path("x").asInt(), node.path("y").asInt(), node.path("z").asInt());
+        if (Math.abs((long) pos.getX()) > 29999984 || Math.abs((long) pos.getZ()) > 29999984
+                || pos.getY() < mod.getWorld().getBottomY() || pos.getY() >= mod.getWorld().getTopY()) {
+            throw new IllegalArgumentException("position outside world");
+        }
+        return pos;
+    }
+
+    private void startClearArea(String callId, JsonNode args) {
+        BlockPos a = readPosition(args.path("from"));
+        BlockPos b = readPosition(args.path("to"));
+        BlockPos from = new BlockPos(Math.min(a.getX(), b.getX()), Math.min(a.getY(), b.getY()), Math.min(a.getZ(), b.getZ()));
+        BlockPos to = new BlockPos(Math.max(a.getX(), b.getX()), Math.max(a.getY(), b.getY()), Math.max(a.getZ(), b.getZ()));
+        startBuilder(callId, from, to, null);
+    }
+
+    private void startBuild(String callId, JsonNode args) throws Exception {
+        String name = args.path("schematic").asText();
+        if (!name.matches("[A-Za-z0-9_-]+\\.schem")) throw new IllegalArgumentException("invalid schematic name");
+        Path directory = MinecraftClient.getInstance().runDirectory.toPath().resolve("schematics").toRealPath();
+        Path file = directory.resolve(name).toRealPath();
+        if (!file.getParent().equals(directory)) throw new IllegalArgumentException("schematic outside directory");
+        var format = BaritoneAPI.getProvider().getSchematicSystem().getByFile(file.toFile())
+                .orElseThrow(() -> new IllegalArgumentException("unsupported schematic"));
+        IStaticSchematic schematic;
+        try (FileInputStream stream = new FileInputStream(file.toFile())) {
+            schematic = format.parse(stream);
+        }
+        BlockPos origin = readPosition(args.path("origin"));
+        if (schematic.widthX() <= 0 || schematic.heightY() <= 0 || schematic.lengthZ() <= 0) {
+            throw new IllegalArgumentException("empty schematic");
+        }
+        BlockPos to = origin.add(schematic.widthX() - 1, schematic.heightY() - 1, schematic.lengthZ() - 1);
+        readPosition(json.createObjectNode().put("x", to.getX()).put("y", to.getY()).put("z", to.getZ()));
+        startBuilder(callId, origin, to, schematic);
+    }
+
+    private void startBuilder(String callId, BlockPos from, BlockPos to, IStaticSchematic schematic) {
+        long volume = ((long) to.getX() - from.getX() + 1) * ((long) to.getY() - from.getY() + 1)
+                * ((long) to.getZ() - from.getZ() + 1);
+        if (volume <= 0 || volume > 32768) throw new IllegalArgumentException("region exceeds 32768 blocks");
+        BridgeBuilderTask task = new BridgeBuilderTask(from, to, schematic);
+        PartialSupplier partial = () -> json.createObjectNode().put("mismatches", task.mismatches())
+                .put("paused", mod.getClientBaritone().getBuilderProcess().isPaused());
+        beginTask(callId, task, () -> result(callId, task.mismatches() == 0 ? "ok" : "failed",
+                task.mismatches() == 0 ? null : "builder_incomplete", partial.get()), partial);
+    }
+
+    /** Completion is checked against the loaded world, including both endpoints of the region. */
+    private final class BridgeBuilderTask extends Task implements ITaskRequiresGrounded {
+        private final BlockPos from;
+        private final BlockPos to;
+        private final IStaticSchematic schematic;
+        private boolean started;
+        private boolean previousBuildInLayers;
+        private boolean previousLayerOrder;
+        private int previousLayerHeight;
+
+        private BridgeBuilderTask(BlockPos from, BlockPos to, IStaticSchematic schematic) {
+            this.from = from;
+            this.to = to;
+            this.schematic = schematic;
+        }
+
+        private int mismatches() {
+            int count = 0;
+            for (BlockPos pos : BlockPos.iterate(from, to)) {
+                if (!mod.getWorld().isChunkLoaded(pos)) { count++; continue; }
+                var actual = mod.getWorld().getBlockState(pos);
+                if (schematic == null ? !actual.isAir() : !actual.equals(schematic.getDirect(
+                        pos.getX() - from.getX(), pos.getY() - from.getY(), pos.getZ() - from.getZ()))) count++;
+            }
+            return count;
+        }
+
+        @Override protected void onStart() {
+            started = true;
+            if (schematic == null) {
+                var settings = BaritoneAPI.getSettings();
+                previousBuildInLayers = settings.buildInLayers.value;
+                previousLayerOrder = settings.layerOrder.value;
+                previousLayerHeight = settings.layerHeight.value;
+                // Preserve lower ground and scaffolds until all reachable upper blocks are gone.
+                settings.buildInLayers.value = true;
+                settings.layerOrder.value = true;
+                settings.layerHeight.value = 4;
+                mod.getClientBaritone().getBuilderProcess().clearArea(from, to);
+            } else mod.getClientBaritone().getBuilderProcess().build("IO schematic", schematic, from);
+        }
+        @Override protected Task onTick() { return null; }
+        @Override protected void onStop(Task interrupt) {
+            mod.getClientBaritone().getBuilderProcess().onLostControl();
+            if (schematic == null && started) {
+                var settings = BaritoneAPI.getSettings();
+                settings.buildInLayers.value = previousBuildInLayers;
+                settings.layerOrder.value = previousLayerOrder;
+                settings.layerHeight.value = previousLayerHeight;
+            }
+        }
+        @Override public boolean isFinished() { return started && mismatches() == 0; }
+        @Override protected boolean isEqual(Task other) { return this == other; }
+        @Override protected String toDebugString() { return "IO builder " + from + " to " + to; }
     }
 
     private interface PartialSupplier {
