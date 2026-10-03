@@ -354,7 +354,13 @@ public final class IoBridge {
     /** Read-only observations do not compete with the active task. Unloaded blocks stay absent. */
     private void query(String callId, String op, JsonNode args) {
         ObjectNode value = json.createObjectNode();
-        if ("query.catalog".equals(op)) {
+        if ("query.catalog".equals(op) && args.has("block")) {
+            String name=args.path("block").asText(); var id=net.minecraft.util.Identifier.of("minecraft",name);
+            boolean valid=Registries.BLOCK.containsId(id); value.put("block",name).put("validBlock",valid);
+            var item=valid ? catalogueMiningItem(Registries.BLOCK.get(id)) : null;
+            if (item==null) value.putNull("miningItem");
+            else value.put("miningItem",Registries.ITEM.getId(item).getPath());
+        } else if ("query.catalog".equals(op)) {
             String item = args.path("item").asText();
             if (!item.matches("[a-z0-9_]{1,128}")) throw new IllegalArgumentException("invalid item");
             value.put("item", item);
@@ -398,7 +404,7 @@ public final class IoBridge {
             value.put("complete", complete);
         } else if ("query.findBlocks".equals(op)) {
             int radius = args.path("radius").asInt(16), limit = args.path("limit").asInt(1);
-            if (radius < 1 || radius > 64 || limit < 1 || limit > 256 || !args.path("blocks").isArray()
+            if (radius < 1 || radius > 128 || limit < 1 || limit > 256 || !args.path("blocks").isArray()
                     || args.path("blocks").size() < 1 || args.path("blocks").size() > 32)
                 throw new IllegalArgumentException("invalid bounded block search");
             java.util.Set<net.minecraft.block.Block> wanted = new java.util.HashSet<>();
@@ -408,11 +414,21 @@ public final class IoBridge {
             }
             var center = args.has("near") ? readPosition(args.path("near")) : mod.getPlayer().getBlockPos();
             var hits = new java.util.PriorityQueue<BlockPos>(java.util.Comparator.<BlockPos>comparingDouble(pos -> pos.getSquaredDistance(center)).reversed());
+            java.util.Set<BlockPos> excluded=new java.util.HashSet<>();
+            if (args.has("exclude")) {
+                if (!args.path("exclude").isArray() || args.path("exclude").size()>4096) throw new IllegalArgumentException("invalid excluded blocks");
+                for (var row:args.path("exclude")) excluded.add(readPosition(row));
+            }
             var loadedChunks = new java.util.HashMap<Long, Boolean>();
             for (BlockPos pos : BlockPos.iterate(center.add(-radius,-radius,-radius), center.add(radius,radius,radius))) {
                 if (pos.getSquaredDistance(center) > radius * radius) continue;
                 long chunk = net.minecraft.util.math.ChunkPos.toLong(pos.getX() >> 4, pos.getZ() >> 4);
                 if (!loadedChunks.computeIfAbsent(chunk, key -> isLoaded(pos))) continue;
+                if (!wanted.contains(mod.getWorld().getBlockState(pos).getBlock()) || excluded.contains(pos)) continue;
+                if (args.path("safeDigOnly").asBoolean(false)) {
+                    String refusal=digRefusal(pos,Registries.BLOCK.getId(mod.getWorld().getBlockState(pos).getBlock()).getPath(),false,false);
+                    if (refusal!=null && !refusal.equals("no_suitable_tool")) continue;
+                }
                 if (wanted.contains(mod.getWorld().getBlockState(pos).getBlock())
                         && (!args.path("ripeOnly").asBoolean(false) || (mod.getWorld().getBlockState(pos).getBlock() instanceof net.minecraft.block.CropBlock crop && crop.isMature(mod.getWorld().getBlockState(pos))))
                         && (!args.path("sourceFluidOnly").asBoolean(false) || mod.getWorld().getFluidState(pos).isStill())) {
@@ -460,6 +476,23 @@ public final class IoBridge {
         } else { result(callId, "failed", "unsupported_op", null); return; }
         ObjectNode ack = json.createObjectNode(); ack.put("callId", callId); send("body.accepted", ack);
         result(callId, "ok", null, value);
+    }
+
+    private java.util.Map<net.minecraft.block.Block,net.minecraft.item.Item> catalogueMiningItems;
+    private net.minecraft.item.Item catalogueMiningItem(net.minecraft.block.Block block) {
+        if (catalogueMiningItems==null) {
+            var miningItems=new java.util.HashMap<net.minecraft.block.Block,net.minecraft.item.Item>();
+            for (String resource:TaskCatalogue.resourceNames()) {
+                var task=TaskCatalogue.getItemTask(resource,1);
+                for (var source:task.getCatalogueMiningBlocks()) for (var target:task.getItemTargets()) {
+                    var matches=target.getMatches(); if (matches==null || matches.length==0) continue;
+                    var item=java.util.Arrays.asList(matches).contains(source.asItem()) ? source.asItem() : matches[0];
+                    if (item!=net.minecraft.item.Items.AIR && (!miningItems.containsKey(source) || item==source.asItem())) miningItems.put(source,item);
+                }
+            }
+            catalogueMiningItems=miningItems;
+        }
+        return catalogueMiningItems.get(block);
     }
 
     private java.util.Optional<net.minecraft.recipe.RecipeEntry<net.minecraft.recipe.SmeltingRecipe>> smeltingRecipe(String input) {

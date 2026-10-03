@@ -72,6 +72,8 @@ public class MineAndCollectTask extends ResourceTask {
         return result.toArray(Block[]::new);
     }
 
+    @Override public Block[] getCatalogueMiningBlocks() { return _blocksToMine.clone(); }
+
     @Override
     protected void onResourceStart(AltoClef mod) {
         mod.getBehaviour().push();

@@ -287,6 +287,9 @@ public abstract class ResourceTask extends Task implements ITaskCanForce {
 
     protected abstract String toDebugStringName();
 
+    /** Sources already declared by this catalogue task, for the local IO bridge. */
+    public net.minecraft.block.Block[] getCatalogueMiningBlocks() { return mineIfPresent==null ? new net.minecraft.block.Block[0] : mineIfPresent.clone(); }
+
     public ItemTarget[] getItemTargets() {
         return itemTargets;
     }

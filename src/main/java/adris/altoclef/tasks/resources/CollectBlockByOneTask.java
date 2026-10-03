@@ -26,6 +26,8 @@ public class CollectBlockByOneTask extends ResourceTask {
         count = targetCount;
     }
 
+    @Override public Block[] getCatalogueMiningBlocks() { return blocks.clone(); }
+
     @Override
     protected boolean shouldAvoidPickingUp(AltoClef mod) {
         return false;

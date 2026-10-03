@@ -39,6 +39,8 @@ public class CollectObsidianTask extends ResourceTask {
         _count = count;
     }
 
+    @Override public Block[] getCatalogueMiningBlocks() { return new Block[]{Blocks.OBSIDIAN}; }
+
     private static BlockPos getLavaStructurePos(BlockPos lavaPos) {
         return lavaPos.add(1,1,0);
     }
