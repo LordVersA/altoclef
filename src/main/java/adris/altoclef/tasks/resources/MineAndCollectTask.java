@@ -154,6 +154,9 @@ public class MineAndCollectTask extends ResourceTask {
 
     public static class MineOrCollectTask extends AbstractDoToClosestObjectTask<Object> {
 
+        // Collect nearby drops before moving on to another block. Items can despawn;
+        // standing blocks cannot. Distant or blacklisted drops still use the normal search.
+        private static final double NEARBY_DROP_DISTANCE_SQ = 8 * 8;
         private final Block[] _blocks;
         private final ItemTarget[] _targets;
         private final Set<BlockPos> blacklist = new HashSet<>();
@@ -180,6 +183,8 @@ public class MineAndCollectTask extends ResourceTask {
 
         @Override
         protected Optional<Object> getClosestTo(AltoClef mod, Vec3d pos) {
+            Optional<ItemEntity> nearbyDrop = getNearbyDrop(mod, pos);
+            if (nearbyDrop.isPresent()) return nearbyDrop.map(Object.class::cast);
             Pair<Double, Optional<BlockPos>> closestBlock = getClosestBlock(mod,pos,  _blocks);
             Pair<Double, Optional<ItemEntity>> closestDrop = getClosestItemDrop(mod,pos,  _targets);
 
@@ -196,6 +201,11 @@ public class MineAndCollectTask extends ResourceTask {
             } else {
                 return closestBlock.getRight().map(Object.class::cast);
             }
+        }
+
+        private Optional<ItemEntity> getNearbyDrop(AltoClef mod, Vec3d pos) {
+            return mod.getEntityTracker().getClosestItemDrop(pos, _targets)
+                    .filter(drop -> drop.squaredDistanceTo(pos) <= NEARBY_DROP_DISTANCE_SQ);
         }
 
         public static Pair<Double, Optional<ItemEntity>> getClosestItemDrop(AltoClef mod,Vec3d pos, ItemTarget... items) {
@@ -233,6 +243,12 @@ public class MineAndCollectTask extends ResourceTask {
         protected Task onTick() {
             AltoClef mod = AltoClef.getInstance();
 
+            if (miningPos != null && getNearbyDrop(mod, mod.getPlayer().getPos()).isPresent()) {
+                // The cached path heuristic must not keep us mining when a drop appears.
+                resetSearch();
+                miningPos = null;
+                progressChecker.reset();
+            }
             if (mod.getClientBaritone().getPathingBehavior().isPathing()) {
                 progressChecker.reset();
             }
