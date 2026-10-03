@@ -305,6 +305,7 @@ public final class IoBridge {
                 }
                 case "task.goto" -> startGoto(callId, args);
                 case "prim.equip" -> startEquip(callId, args);
+                case "prim.dig" -> startDig(callId, args);
                 case "task.food" -> startFood(callId, args.path("count").asInt(20));
                 case "task.follow" -> startFollow(callId, args);
                 case "task.give" -> startGive(callId, args);
@@ -383,6 +384,81 @@ public final class IoBridge {
         var item = net.minecraft.registry.Registries.ITEM.get(id);
         return mod.getPlayer().networkHandler.getRecipeManager().getFirstMatch(net.minecraft.recipe.RecipeType.SMELTING,
                 new net.minecraft.recipe.input.SingleStackRecipeInput(new net.minecraft.item.ItemStack(item)), mod.getWorld());
+    }
+
+    private String digRefusal(BlockPos pos, String expected, boolean allowLiquid) {
+        if (!isLoaded(pos)) return "not_loaded";
+        var state = mod.getWorld().getBlockState(pos);
+        if (state.isAir() || !state.getFluidState().isEmpty()) return null;
+        if (!Registries.BLOCK.getId(state.getBlock()).getPath().equals(expected)) return "unexpected_block";
+        var feet = mod.getPlayer().getBlockPos();
+        if (pos.getX() == feet.getX() && pos.getZ() == feet.getZ()
+                && (pos.getY() < feet.getY() || pos.getY() >= feet.getY() + 2)) return "unsafe_dig";
+        for (var direction : net.minecraft.util.math.Direction.values()) {
+            var neighbour = pos.offset(direction);
+            if (!isLoaded(neighbour)) return "not_loaded";
+            if (!allowLiquid && !mod.getWorld().getFluidState(neighbour).isEmpty()) return "liquid_adjacent";
+        }
+        if (state.getHardness(mod.getWorld(), pos) < 0) return "no_suitable_tool";
+        if (state.isToolRequired()) {
+            boolean suitable = false;
+            for (int i = 0; i < mod.getPlayer().getInventory().size(); i++)
+                if (mod.getPlayer().getInventory().getStack(i).isSuitableFor(state)) suitable = true;
+            if (!suitable) return "no_suitable_tool";
+        }
+        return null;
+    }
+
+    private void startDig(String callId, JsonNode args) {
+        BlockPos pos = readPosition(args.path("pos"));
+        String expected = args.path("expectedBlock").asText();
+        if (!expected.matches("[a-z0-9_]{1,128}")) throw new IllegalArgumentException("invalid expected block");
+        var task = new IoDigTask(pos, expected, args.path("collect").asBoolean(true), args.path("allowLiquid").asBoolean(false));
+        PartialSupplier observed = () -> {
+            ObjectNode value = json.createObjectNode().put("block", expected);
+            value.putObject("pos").put("x", pos.getX()).put("y", pos.getY()).put("z", pos.getZ());
+            return value;
+        };
+        beginTask(callId, task, () -> result(callId, task.failure == null ? "ok" : "failed", task.failure, observed.get()), observed);
+    }
+
+    private final class IoDigTask extends Task implements ITaskRequiresGrounded {
+        private final BlockPos pos;
+        private final String expected;
+        private final boolean collect;
+        private final boolean allowLiquid;
+        private final Task destroy;
+        private String failure;
+        private long brokenAt;
+        IoDigTask(BlockPos pos, String expected, boolean collect, boolean allowLiquid) {
+            this.pos = pos; this.expected = expected; this.collect = collect; this.allowLiquid = allowLiquid;
+            destroy = new adris.altoclef.tasks.construction.DestroyBlockTask(pos);
+        }
+        private boolean gone() {
+            return isLoaded(pos) && (mod.getWorld().getBlockState(pos).isAir() || !mod.getWorld().getFluidState(pos).isEmpty());
+        }
+        private java.util.Optional<net.minecraft.entity.ItemEntity> nearbyDrop() {
+            return mod.getEntityTracker().getDroppedItems().stream()
+                    .filter(entity -> entity.isAlive() && entity.squaredDistanceTo(net.minecraft.util.math.Vec3d.ofCenter(pos)) <= 16)
+                    .min(java.util.Comparator.comparingDouble(entity -> entity.squaredDistanceTo(mod.getPlayer())));
+        }
+        @Override protected void onStart() { }
+        @Override protected Task onTick() {
+            failure = digRefusal(pos, expected, allowLiquid);
+            if (failure != null) return null;
+            if (!gone()) return destroy;
+            if (brokenAt == 0) brokenAt = System.currentTimeMillis();
+            if (collect && System.currentTimeMillis() - brokenAt >= 400)
+                return nearbyDrop().map(entity -> (Task) new GetToEntityTask(entity, 0.5)).orElse(null);
+            return null;
+        }
+        @Override public boolean isFinished() {
+            return failure != null || (gone() && (!collect || (brokenAt != 0
+                    && System.currentTimeMillis() - brokenAt >= 400 && (nearbyDrop().isEmpty() || System.currentTimeMillis() - brokenAt >= 8000))));
+        }
+        @Override protected void onStop(Task interrupt) { }
+        @Override protected boolean isEqual(Task other) { return this == other; }
+        @Override protected String toDebugString() { return "IO dig " + pos; }
     }
 
     private net.minecraft.entity.EquipmentSlot equipmentSlot(String slot) {
