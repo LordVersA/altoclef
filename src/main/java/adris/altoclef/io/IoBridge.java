@@ -7,7 +7,7 @@ import adris.altoclef.eventbus.events.ChatMessageEvent;
 import adris.altoclef.eventbus.events.ClientTickEvent;
 import adris.altoclef.tasks.movement.GetToBlockTask;
 import adris.altoclef.tasks.movement.GetToXZTask;
-import adris.altoclef.tasks.movement.FollowPlayerTask;
+import adris.altoclef.tasks.movement.GetToEntityTask;
 import adris.altoclef.tasks.movement.DefaultGoToDimensionTask;
 import adris.altoclef.tasks.entity.GiveItemToPlayerTask;
 import adris.altoclef.tasks.resources.CollectFoodTask;
@@ -298,7 +298,7 @@ public final class IoBridge {
                 case "task.get" -> startGet(callId, args.path("item").asText(), args.path("count").asInt(1));
                 case "task.goto" -> startGoto(callId, args);
                 case "task.food" -> startFood(callId, args.path("count").asInt(20));
-                case "task.follow" -> startFollow(callId, args.path("player").asText());
+                case "task.follow" -> startFollow(callId, args);
                 case "task.give" -> startGive(callId, args);
                 case "baritone.clearArea" -> startClearArea(callId, args);
                 case "baritone.build" -> startBuild(callId, args);
@@ -345,6 +345,10 @@ public final class IoBridge {
             for (var entity : mod.getWorld().getEntities()) {
                 ObjectNode entry = entities.addObject();
                 entry.put("id", String.valueOf(entity.getId()));
+                if (entity instanceof net.minecraft.entity.player.PlayerEntity player) {
+                    entry.put("username", player.getName().getString());
+                    entry.put("uuid", player.getUuid().toString());
+                }
                 entry.put("type", net.minecraft.registry.Registries.ENTITY_TYPE.getId(entity.getType()).getPath());
                 ObjectNode pos = entry.putObject("pos");
                 pos.put("x", entity.getX()); pos.put("y", entity.getY()); pos.put("z", entity.getZ());
@@ -417,12 +421,56 @@ public final class IoBridge {
         return value;
     }
 
-    /** Following is continuous; Core cancels it after independently checking the follower. */
-    private void startFollow(String callId, String player) {
-        if (!player.matches("[A-Za-z0-9_]{1,16}")) throw new IllegalArgumentException("invalid player");
-        beginTask(callId, new FollowPlayerTask(player),
-                () -> result(callId, "failed", "follow_ended", playerDistance(player)),
-                () -> playerDistance(player));
+    /** Follow moving entities; optional arrival/duration bounds retain the skill contracts. */
+    private void startFollow(String callId, JsonNode args) {
+        String player = args.path("player").asText();
+        double distance = args.path("distance").asDouble(2);
+        boolean arrival = args.has("stopWithin");
+        if (arrival) distance = args.path("stopWithin").asDouble();
+        long duration = args.path("maxDurationMs").asLong(Long.MAX_VALUE);
+        if (!player.matches("[A-Za-z0-9_]{1,16}") || !Double.isFinite(distance) || distance < 1 || distance > 16
+                || duration < 1000 || (args.has("maxDurationMs") && duration > 3600000))
+            throw new IllegalArgumentException("invalid follow arguments");
+        if (mod.getEntityTracker().getPlayerEntity(player).isEmpty()) {
+            result(callId, "failed", "player_not_visible", null); return;
+        }
+        BridgeFollowTask task = new BridgeFollowTask(player, distance, duration, arrival);
+        PartialSupplier observed = () -> {
+            ObjectNode value = playerDistance(player);
+            value.put("followedForMs", Math.max(0, System.currentTimeMillis() - task.startedAt));
+            return value;
+        };
+        beginTask(callId, task, () -> {
+            ObjectNode value = observed.get();
+            value.put("endedBecause", mod.getEntityTracker().getPlayerEntity(player).isEmpty()
+                    ? "player_left" : task.arrival ? "arrived" : "duration_reached");
+            result(callId, "ok", null, value);
+        }, observed);
+    }
+
+    private final class BridgeFollowTask extends Task {
+        private final String player;
+        private final double distance;
+        private final long duration;
+        private final boolean arrival;
+        private long startedAt;
+        private BridgeFollowTask(String player, double distance, long duration, boolean arrival) {
+            this.player = player; this.distance = distance; this.duration = duration; this.arrival = arrival;
+        }
+        @Override protected void onStart() { startedAt = System.currentTimeMillis(); }
+        @Override protected Task onTick() {
+            return mod.getEntityTracker().getPlayerEntity(player)
+                    .map(entity -> (Task) new GetToEntityTask(entity, distance)).orElse(null);
+        }
+        @Override protected void onStop(Task interrupt) { }
+        @Override public boolean isFinished() {
+            if (startedAt == 0) return false;
+            var target = mod.getEntityTracker().getPlayerEntity(player);
+            return target.isEmpty() || (arrival && target.get().distanceTo(mod.getPlayer()) <= distance)
+                    || System.currentTimeMillis() - startedAt >= duration;
+        }
+        @Override protected boolean isEqual(Task other) { return this == other; }
+        @Override protected String toDebugString() { return "IO follow " + player; }
     }
 
     /** The result reports dropped items; the operator must independently verify pickup. */
