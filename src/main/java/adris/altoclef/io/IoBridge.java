@@ -313,7 +313,10 @@ public final class IoBridge {
                 case "prim.equip" -> startEquip(callId, args);
                 case "prim.dig" -> startDig(callId, args);
                 case "prim.place" -> startPlace(callId, args);
-                case "prim.use" -> startEat(callId,args);
+                case "prim.use" -> {
+                    if ("use_on".equals(args.path("action").asText())) startUseOn(callId,args);
+                    else startEat(callId,args);
+                }
                 case "prim.sleep" -> startSleep(callId,args);
                 case "prim.activate" -> {
                     if ("clear_furnace".equals(args.path("interaction").asText())) startClearFurnace(callId,args);
@@ -405,7 +408,8 @@ public final class IoBridge {
                 if (pos.getSquaredDistance(center) > radius * radius) continue;
                 long chunk = net.minecraft.util.math.ChunkPos.toLong(pos.getX() >> 4, pos.getZ() >> 4);
                 if (!loadedChunks.computeIfAbsent(chunk, key -> isLoaded(pos))) continue;
-                if (wanted.contains(mod.getWorld().getBlockState(pos).getBlock())) {
+                if (wanted.contains(mod.getWorld().getBlockState(pos).getBlock())
+                        && (!args.path("sourceFluidOnly").asBoolean(false) || mod.getWorld().getFluidState(pos).isStill())) {
                     hits.add(pos.toImmutable()); if (hits.size() > limit) hits.poll();
                 }
             }
@@ -434,6 +438,8 @@ public final class IoBridge {
             for (var entity : mod.getWorld().getEntities()) {
                 ObjectNode entry = entities.addObject();
                 entry.put("id", String.valueOf(entity.getId()));
+                entry.put("uuid",entity.getUuid().toString()); entry.put("alive",entity.isAlive());
+                if (entity instanceof net.minecraft.entity.passive.SheepEntity sheep) entry.put("sheared",sheep.isSheared());
                 if (entity instanceof net.minecraft.entity.player.PlayerEntity player) {
                     entry.put("username", player.getName().getString());
                     entry.put("uuid", player.getUuid().toString());
@@ -487,6 +493,118 @@ public final class IoBridge {
         }
         value.put("emptySlots", slots-used);
         return value;
+    }
+
+    private void startUseOn(String callId,JsonNode args) {
+        String item=args.path("item").asText();
+        var id=net.minecraft.util.Identifier.of("minecraft",item);
+        if (!Registries.ITEM.containsId(id) || countOf(item)<1) { result(callId,"failed","not_in_inventory",null); return; }
+        var target=args.path("target");
+        BlockPos pos=target.has("pos") ? readPosition(target.path("pos")) : null;
+        int entityId=target.path("entityId").asInt(-1);
+        UUID entityUuid=target.has("entityUuid") ? UUID.fromString(target.path("entityUuid").asText()) : null;
+        if (pos==null && (entityId<0 || entityUuid==null)) throw new IllegalArgumentException("entity identity required");
+        if (pos!=null && !target.has("expectedBlock")) throw new IllegalArgumentException("block identity required");
+        var task=new IoUseOnTask(item,Registries.ITEM.get(id),pos,target.path("expectedBlock").asText(),entityId,entityUuid);
+        beginTask(callId,task,() -> result(callId,task.failure==null ? "ok" : "failed",task.failure,task.value()),task::value);
+    }
+    private final class IoUseOnTask extends Task implements ITaskRequiresGrounded {
+        private final String itemName,expectedBlock;
+        private final net.minecraft.item.Item item;
+        private final BlockPos pos;
+        private final int entityId;
+        private final UUID entityUuid;
+        private net.minecraft.util.math.Vec3d at;
+        private String expected,failure;
+        private int before;
+        private long started,usedAt;
+        private boolean done,oldBreak,oldPlace;
+        private Task movement;
+        IoUseOnTask(String itemName,net.minecraft.item.Item item,BlockPos pos,String expectedBlock,int entityId,UUID entityUuid) {
+            this.itemName=itemName; this.item=item; this.pos=pos; this.expectedBlock=expectedBlock; this.entityId=entityId; this.entityUuid=entityUuid;
+        }
+        private int quantity(String expected) {
+            if (!"wool".equals(expected)) return countOf(expected);
+            int total=0;
+            for (int i=0;i<36;i++) {
+                ItemStack stack=mod.getPlayer().getInventory().getStack(i);
+                if (Registries.ITEM.getId(stack.getItem()).getPath().endsWith("_wool")) total+=stack.getCount();
+            }
+            return total;
+        }
+        ObjectNode value() {
+            ObjectNode value=json.createObjectNode().put("verified",expected!=null).put("before",before);
+            if (expected!=null) value.put("expected",expected);
+            if (at!=null) value.putObject("at").put("x",pos==null ? at.x : pos.getX()).put("y",pos==null ? at.y : pos.getY()).put("z",pos==null ? at.z : pos.getZ());
+            return value;
+        }
+        @Override protected void onStart() {
+            started=System.currentTimeMillis(); StorageHelper.closeScreen();
+            var settings=mod.getClientBaritoneSettings(); oldBreak=settings.allowBreak.value; oldPlace=settings.allowPlace.value;
+            mod.getBehaviour().push(); mod.getBehaviour().addProtectedItems(item); mod.getBehaviour().avoidBlockBreaking(p->true);
+            settings.allowBreak.value=false; settings.allowPlace.value=false;
+        }
+        @Override protected Task onTick() {
+            long now=System.currentTimeMillis();
+            if (usedAt!=0) {
+                if (expected!=null && quantity(expected)>before) { done=true; return null; }
+                if (expected==null && now-usedAt>=400) { done=true; return null; }
+                if (now-usedAt>4000) { failure="item_use_failed"; done=true; return null; }
+                if ("wool".equals(expected) && now-usedAt>=500) {
+                    var drop=mod.getEntityTracker().getDroppedItems().stream().filter(e->e.isAlive()
+                        && e.squaredDistanceTo(at)<=16 && Registries.ITEM.getId(e.getStack().getItem()).getPath().endsWith("_wool"))
+                        .min(java.util.Comparator.comparingDouble(e->e.squaredDistanceTo(mod.getPlayer())));
+                    if (drop.isPresent()) return new GetToEntityTask(drop.get(),0.25);
+                }
+                return null;
+            }
+            var entity=pos==null ? mod.getWorld().getEntityById(entityId) : null;
+            if (pos==null && (entity==null || !entity.isAlive() || !entity.getUuid().equals(entityUuid))) { failure="target_not_found"; done=true; return null; }
+            if (pos!=null && (!isLoaded(pos) || !Registries.BLOCK.getId(mod.getWorld().getBlockState(pos).getBlock()).getPath().equals(expectedBlock))) { failure="target_not_found"; done=true; return null; }
+            at=entity!=null ? entity.getPos() : net.minecraft.util.math.Vec3d.ofCenter(pos);
+            if (now-started>30000) { failure="container_unreachable"; done=true; return null; }
+            if (mod.getPlayer().squaredDistanceTo(at)>9) {
+                if (entity!=null) return new GetToEntityTask(entity,2);
+                if (movement==null) movement=new adris.altoclef.tasks.movement.CustomBaritoneGoalTask(false) {
+                    @Override protected baritone.api.pathing.goals.Goal newGoal(AltoClef mod) { return new baritone.api.pathing.goals.GoalNear(pos,2); }
+                    @Override protected boolean isEqual(Task other) { return this==other; }
+                    @Override protected String toDebugString() { return "IO approach item-use target"; }
+                };
+                return movement;
+            }
+            if (countOf(itemName)<1) { failure="not_in_inventory"; done=true; return null; }
+            if (itemName.equals("bucket") && pos!=null && mod.getWorld().getBlockState(pos).isOf(Blocks.WATER)) {
+                if (!mod.getWorld().getFluidState(pos).isStill()) { failure="not_water_source"; done=true; return null; }
+                expected="water_bucket";
+            } else if (itemName.equals("shears") && entity instanceof net.minecraft.entity.passive.SheepEntity sheep) {
+                if (!sheep.isShearable() || sheep.isSheared()) { failure="item_use_failed"; done=true; return null; }
+                var wool=new ItemStack(Registries.ITEM.get(net.minecraft.util.Identifier.of("minecraft",sheep.getColor().getName()+"_wool")));
+                boolean room=false;
+                for (int i=0;i<36;i++) {
+                    var held=mod.getPlayer().getInventory().getStack(i);
+                    if (held.isEmpty() || (ItemStack.areItemsAndComponentsEqual(held,wool) && held.getCount()<=held.getMaxCount()-3)) { room=true; break; }
+                }
+                if (!room) { failure="inventory_full"; done=true; return null; }
+                expected="wool";
+            }
+            before=expected==null ? 0 : quantity(expected);
+            if (!mod.getSlotHandler().forceEquipItem(new net.minecraft.item.Item[]{item},true)) return null;
+            var look=entity!=null ? at.add(0,entity.getHeight()/2,0) : at;
+            adris.altoclef.util.helpers.LookHelper.lookAt(mod,look,false);
+            if (entity!=null) mod.getController().interactEntity(mod.getPlayer(),entity,net.minecraft.util.Hand.MAIN_HAND);
+            else if (itemName.contains("bucket")) mod.getController().interactItem(mod.getPlayer(),net.minecraft.util.Hand.MAIN_HAND);
+            else mod.getController().interactBlock(mod.getPlayer(),net.minecraft.util.Hand.MAIN_HAND,
+                new net.minecraft.util.hit.BlockHitResult(at,net.minecraft.util.math.Direction.UP,pos,false));
+            usedAt=now; return null;
+        }
+        @Override public boolean isFinished() { return done; }
+        @Override protected void onStop(Task interrupt) {
+            mod.getClientBaritone().getPathingBehavior().forceCancel(); mod.getInputControls().release(baritone.api.utils.input.Input.CLICK_RIGHT);
+            StorageHelper.closeScreen(); mod.getBehaviour().pop();
+            mod.getClientBaritoneSettings().allowBreak.value=oldBreak; mod.getClientBaritoneSettings().allowPlace.value=oldPlace;
+        }
+        @Override protected boolean isEqual(Task other) { return this==other; }
+        @Override protected String toDebugString() { return "IO use held " + itemName + " on observed target"; }
     }
 
     private void startClearFurnace(String callId,JsonNode args) {
