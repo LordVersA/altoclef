@@ -72,6 +72,7 @@ public final class IoBridge {
     // Only touched on the client thread.
     private String runningCallId;
     private boolean cancelling;
+    private boolean usedCraftingTable;
     private long lastStateAt;
     private String lastStateJson = "";
     private final Map<String, JsonNode> finished = new HashMap<>();
@@ -295,7 +296,7 @@ public final class IoBridge {
 
         try {
             switch (op) {
-                case "task.get" -> startGet(callId, args.path("item").asText(), args.path("count").asInt(1));
+                case "task.get" -> startGet(callId, args.path("item").asText(), args.path("count").asInt(1), args.path("additional").asBoolean(false));
                 case "task.goto" -> startGoto(callId, args);
                 case "task.food" -> startFood(callId, args.path("count").asInt(20));
                 case "task.follow" -> startFollow(callId, args);
@@ -320,7 +321,12 @@ public final class IoBridge {
     /** Read-only observations do not compete with the active task. Unloaded blocks stay absent. */
     private void query(String callId, String op, JsonNode args) {
         ObjectNode value = json.createObjectNode();
-        if ("query.blockAt".equals(op)) {
+        if ("query.catalog".equals(op)) {
+            String item = args.path("item").asText();
+            if (!item.matches("[a-z0-9_]{1,128}")) throw new IllegalArgumentException("invalid item");
+            value.put("item", item);
+            value.put("canGet", TaskCatalogue.taskExists(item));
+        } else if ("query.blockAt".equals(op)) {
             BlockPos pos = readPosition(args.path("pos"));
             boolean loaded = isLoaded(pos);
             value.put("loaded", loaded);
@@ -358,18 +364,25 @@ public final class IoBridge {
         result(callId, "ok", null, value);
     }
 
-    private void startGet(String callId, String item, int count) {
+    private void startGet(String callId, String item, int count, boolean additional) {
         if (!TaskCatalogue.taskExists(item)) {
             result(callId, "failed", "unknown_item", null);
             return;
         }
-        Task task = TaskCatalogue.getItemTask(item, count);
+        if (count < 1 || count > 2304) throw new IllegalArgumentException("invalid item count");
+        int before = countOf(item);
+        int target = additional ? Math.addExact(before, count) : count;
+        if (target > 2304) throw new IllegalArgumentException("target exceeds inventory capacity");
+        Task task = TaskCatalogue.getItemTask(item, target);
         beginTask(callId, task, () -> {
             int have = countOf(item);
             ObjectNode value = json.createObjectNode();
             value.put("item", item);
             value.put("count", have);
-            if (have >= count) result(callId, "ok", null, value);
+            value.put("before", before);
+            value.put("gained", have - before);
+            value.put("usedTable", usedCraftingTable);
+            if (have >= target) result(callId, "ok", null, value);
             else result(callId, "failed", "incomplete", value);
         }, () -> {
             ObjectNode partial = json.createObjectNode();
@@ -656,6 +669,7 @@ public final class IoBridge {
     private void beginTask(String callId, Task task, Runnable onDone, PartialSupplier partialNow) {
         runningCallId = callId;
         cancelling = false;
+        usedCraftingTable = false;
         currentPartial = partialNow;
         mod.runUserTask(task, () -> {
             // The user chain also calls this when it is cancelled: then onCancel answers.
@@ -718,6 +732,9 @@ public final class IoBridge {
     }
 
     private void tick() {
+        if (runningCallId != null && mod.getPlayer() != null
+                && mod.getPlayer().currentScreenHandler instanceof net.minecraft.screen.CraftingScreenHandler)
+            usedCraftingTable = true;
         if (welcomed) pushState(false);
     }
 
