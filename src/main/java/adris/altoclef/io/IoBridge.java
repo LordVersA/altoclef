@@ -312,7 +312,11 @@ public final class IoBridge {
                 case "prim.equip" -> startEquip(callId, args);
                 case "prim.dig" -> startDig(callId, args);
                 case "prim.place" -> startPlace(callId, args);
-                case "prim.activate" -> startObserveContainer(callId, args);
+                case "prim.activate" -> {
+                    if ("withdraw".equals(args.path("interaction").asText())) startContainerTransfer(callId, args, false);
+                    else startObserveContainer(callId, args);
+                }
+                case "task.deposit" -> startContainerTransfer(callId, args, true);
                 case "task.food" -> startFood(callId, args.path("count").asInt(20));
                 case "task.follow" -> startFollow(callId, args);
                 case "task.give" -> startGive(callId, args);
@@ -458,6 +462,147 @@ public final class IoBridge {
         }
         value.put("emptySlots", slots-used);
         return value;
+    }
+
+    private void startContainerTransfer(String callId, JsonNode args, boolean deposit) {
+        BlockPos pos = readPosition(args.path("pos"));
+        String item = args.path("item").asText();
+        var id = net.minecraft.util.Identifier.of("minecraft", item);
+        if (!Registries.ITEM.containsId(id)) { result(callId,"failed","item_not_present",null); return; }
+        int count = args.has("count") ? args.path("count").asInt() : 2304;
+        if (count < 1 || count > 2304) throw new IllegalArgumentException("invalid transfer count");
+        if (!isLoaded(pos)) { result(callId,"failed","container_not_found",null); return; }
+        String name = Registries.BLOCK.getId(mod.getWorld().getBlockState(pos).getBlock()).getPath();
+        if (!storageContainer(name)) { result(callId,"failed","not_a_container",null); return; }
+        var task = new IoContainerTransferTask(pos,name,Registries.ITEM.get(id),item,count,deposit);
+        beginTask(callId,task,() -> result(callId,task.failure == null ? "ok" : "failed",task.failure,task.value()),task::value);
+    }
+
+    /** Move held stacks without gathering, discarding, or leaving a partial stack on the cursor. */
+    private final class IoContainerTransferTask extends Task implements ITaskRequiresGrounded {
+        private final BlockPos pos;
+        private final String name, itemName;
+        private final net.minecraft.item.Item item;
+        private final int requested;
+        private final boolean deposit;
+        private final Task interact;
+        private net.minecraft.screen.ScreenHandler handler;
+        private int storageSlots, beforeSource, beforeDestination, wanted, moved, sourceSlot=-1;
+        private long lastClick;
+        private boolean done;
+        private String failure;
+        private ObjectNode observed;
+        IoContainerTransferTask(BlockPos pos, String name, net.minecraft.item.Item item, String itemName, int requested, boolean deposit) {
+            this.pos=pos; this.name=name; this.item=item; this.itemName=itemName;
+            this.requested=requested; this.deposit=deposit;
+            interact=new adris.altoclef.tasks.InteractWithBlockTask(pos);
+        }
+        private int count(boolean source) {
+            int total=0;
+            boolean storage = source != deposit;
+            int start=storage ? 0 : storageSlots, end=storage ? storageSlots : handler.slots.size();
+            for (int i=start;i<end;i++) {
+                ItemStack stack=handler.getSlot(i).getStack();
+                if (stack.isOf(item)) total+=stack.getCount();
+            }
+            return total;
+        }
+        private int destination(ItemStack cursor, boolean source) {
+            boolean storage=source != deposit;
+            int start=storage ? 0 : storageSlots, end=storage ? storageSlots : handler.slots.size();
+            // Fill compatible stacks first; never swap a stack with different components.
+            for (int pass=0;pass<2;pass++) for (int i=start;i<end;i++) {
+                var slot=handler.getSlot(i); ItemStack stack=slot.getStack();
+                if (!slot.canInsert(cursor)) continue;
+                if (stack.isEmpty()) { if (pass==1) return i; }
+                else if (pass==0 && ItemStack.areItemsAndComponentsEqual(stack,cursor)
+                        && stack.getCount()<slot.getMaxItemCount(cursor)) return i;
+            }
+            return -1;
+        }
+        private void click(int index, int button) {
+            mod.getController().clickSlot(handler.syncId,index,button,net.minecraft.screen.slot.SlotActionType.PICKUP,mod.getPlayer());
+            mod.getSlotHandler().registerSlotAction();
+            lastClick=System.currentTimeMillis();
+        }
+        private boolean restoreCursor(boolean force) {
+            ItemStack cursor=handler.getCursorStack();
+            if (cursor.isEmpty()) return true;
+            int target=-1;
+            if (sourceSlot>=0) {
+                var slot=handler.getSlot(sourceSlot); var stack=slot.getStack();
+                if (slot.canInsert(cursor) && (stack.isEmpty() || (ItemStack.areItemsAndComponentsEqual(stack,cursor)
+                        && stack.getCount()+cursor.getCount()<=slot.getMaxItemCount(cursor)))) target=sourceSlot;
+            }
+            if (target<0) target=destination(cursor,true);
+            if (target<0) { failure="container_full"; return false; }
+            if (force) {
+                mod.getController().clickSlot(handler.syncId,target,0,net.minecraft.screen.slot.SlotActionType.PICKUP,mod.getPlayer());
+                mod.getSlotHandler().registerSlotAction();
+            } else click(target,0);
+            return handler.getCursorStack().isEmpty();
+        }
+        ObjectNode value() {
+            ObjectNode value=json.createObjectNode().put("item",itemName).put("moved",moved);
+            if (handler != null) {
+                value.put("inventoryDelta",deposit ? beforeSource-count(true) : count(false)-beforeDestination);
+                value.put("containerDelta",deposit ? count(false)-beforeDestination : beforeSource-count(true));
+            }
+            if (observed != null) value.set("observation",observed.deepCopy());
+            return value;
+        }
+        @Override protected void onStart() {
+            StorageHelper.closeScreen(); syncedInventoryHandler=null;
+            mod.getBehaviour().push(); mod.getBehaviour().addProtectedItems(item);
+        }
+        @Override protected Task onTick() {
+            if (!isLoaded(pos)) { failure="container_not_found"; done=true; return null; }
+            if (!Registries.BLOCK.getId(mod.getWorld().getBlockState(pos).getBlock()).getPath().equals(name)) {
+                failure="not_a_container"; done=true; return null;
+            }
+            if (handler==null) {
+                if (containerSnapshot(pos)==null) return interact;
+                handler=mod.getPlayer().currentScreenHandler; storageSlots=handler.slots.size()-36;
+                beforeSource=count(true); beforeDestination=count(false); wanted=Math.min(requested,beforeSource);
+            }
+            if (mod.getPlayer().currentScreenHandler!=handler) { failure="open_failed"; done=true; return null; }
+            moved=count(false)-beforeDestination;
+            if (!mod.getSlotHandler().canDoSlotAction()) return null;
+            if (moved>=wanted || failure!=null) {
+                if (!restoreCursor(false)) return null;
+                if (System.currentTimeMillis()-lastClick<400) return null;
+                observed=containerSnapshot(pos);
+                if (beforeSource-count(true)!=moved || moved<0 || moved>wanted) failure="transfer_mismatch";
+                done=true; return null;
+            }
+            ItemStack cursor=handler.getCursorStack();
+            if (cursor.isEmpty()) {
+                boolean storage=!deposit;
+                int start=storage ? 0 : storageSlots, end=storage ? storageSlots : handler.slots.size();
+                for (int i=start;i<end;i++) {
+                    ItemStack stack=handler.getSlot(i).getStack();
+                    if (stack.isOf(item) && destination(stack,false)>=0) { sourceSlot=i; click(i,0); return null; }
+                }
+                failure="container_full"; return null;
+            }
+            int target=destination(cursor,false);
+            if (target<0) { failure="container_full"; return null; }
+            click(target,cursor.getCount()<=wanted-moved ? 0 : 1);
+            return null;
+        }
+        @Override public boolean isFinished() { return done || (failure!=null && handler==null); }
+        @Override protected void onStop(Task interrupt) {
+            if (handler!=null && mod.getPlayer().currentScreenHandler==handler) {
+                restoreCursor(true);
+                moved=count(false)-beforeDestination;
+                observed=containerSnapshot(pos);
+                // Closing a withdrawal with a nonempty cursor would give unrequested stock to the player.
+                if (handler.getCursorStack().isEmpty()) StorageHelper.closeScreen();
+            } else StorageHelper.closeScreen();
+            mod.getBehaviour().pop();
+        }
+        @Override protected boolean isEqual(Task other) { return this==other; }
+        @Override protected String toDebugString() { return "IO " + (deposit ? "deposit " : "withdraw ") + itemName; }
     }
 
     private void startObserveContainer(String callId, JsonNode args) {
