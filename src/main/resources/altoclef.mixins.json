@@ -34,7 +34,8 @@
     "LoadChunkMixin",
     "MixinLocalPlayer",
     "PlayerCollidesWithEntityMixin",
-    "SimpleOptionMixin"
+    "SimpleOptionMixin",
+    "SmeltFuelMixin"
   ],
   "injectors": {
     "defaultRequire": 1

@@ -186,13 +186,14 @@ public class SmeltInFurnaceTask extends ResourceTask {
                     - (outputTarget.matches(furnaceCache.outputSlot.getItem()) ? furnaceCache.outputSlot.getCount() : 0);
             double totalFuelInFurnace = ItemHelper.getFuelAmount(furnaceCache.fuelSlot) + furnaceCache.burningFuelCount + furnaceCache.burnPercentage;
             // Fuel needed = (mat_target - out_in_inventory - out_in_furnace - totalFuelInFurnace)
-            double fuelNeeded = ignoreMaterials
-                    ? Math.min(materialTarget.matches(furnaceCache.materialSlot.getItem()) ? furnaceCache.materialSlot.getCount() : 0, materialTarget.getTargetCount())
-                    : materialTarget.getTargetCount()
-                    /* - mod.getItemStorage().getItemCountInventoryOnly(materialTarget.getMatches()) */
+            int remainingOutput = outputTarget.getTargetCount()
                     - mod.getItemStorage().getItemCountInventoryOnly(outputTarget.getMatches())
-                    - (outputTarget.matches(furnaceCache.outputSlot.getItem()) ? furnaceCache.outputSlot.getCount() : 0)
-                    - totalFuelInFurnace;
+                    - (outputTarget.matches(furnaceCache.outputSlot.getItem()) ? furnaceCache.outputSlot.getCount() : 0);
+            // Subtract cached fuel in both branches. Otherwise moving the last fuel stack
+            // into the furnace makes ignoreMaterials start a new fuel-gathering trip.
+            double fuelNeeded = (ignoreMaterials
+                    ? Math.min(materialTarget.matches(furnaceCache.materialSlot.getItem()) ? furnaceCache.materialSlot.getCount() : 0, remainingOutput)
+                    : remainingOutput) - totalFuelInFurnace;
 
             // We don't have enough materials...
             if (mod.getItemStorage().getItemCount(materialTarget.getMatches()) < materialsNeeded) {

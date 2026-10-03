@@ -73,6 +73,8 @@ public final class IoBridge {
     private String runningCallId;
     private boolean cancelling;
     private boolean usedCraftingTable;
+    private static net.minecraft.item.Item smeltFuel;
+    public static net.minecraft.item.Item selectedSmeltFuel() { return smeltFuel; }
     private long lastStateAt;
     private String lastStateJson = "";
     private final Map<String, JsonNode> finished = new HashMap<>();
@@ -171,6 +173,7 @@ public final class IoBridge {
             if (runningCallId != null) {
                 cancelling = true;
                 mod.cancelUserTask();
+                smeltFuel = null;
                 runningCallId = null;
             }
         });
@@ -296,7 +299,10 @@ public final class IoBridge {
 
         try {
             switch (op) {
-                case "task.get" -> startGet(callId, args.path("item").asText(), args.path("count").asInt(1), args.path("additional").asBoolean(false));
+                case "task.get" -> {
+                    if (args.has("smeltInput")) startSmelt(callId, args);
+                    else startGet(callId, args.path("item").asText(), args.path("count").asInt(1), args.path("additional").asBoolean(false));
+                }
                 case "task.goto" -> startGoto(callId, args);
                 case "task.food" -> startFood(callId, args.path("count").asInt(20));
                 case "task.follow" -> startFollow(callId, args);
@@ -308,6 +314,7 @@ public final class IoBridge {
             }
         } catch (Exception e) {
             runningCallId = null;
+            smeltFuel = null;
             result(callId, "error", String.valueOf(e), null);
         }
     }
@@ -326,6 +333,10 @@ public final class IoBridge {
             if (!item.matches("[a-z0-9_]{1,128}")) throw new IllegalArgumentException("invalid item");
             value.put("item", item);
             value.put("canGet", TaskCatalogue.taskExists(item));
+            var recipe = smeltingRecipe(item);
+            if (recipe.isPresent()) value.put("smeltOutput", net.minecraft.registry.Registries.ITEM.getId(
+                    recipe.get().value().getResult(mod.getWorld().getRegistryManager()).getItem()).getPath());
+            else value.putNull("smeltOutput");
         } else if ("query.blockAt".equals(op)) {
             BlockPos pos = readPosition(args.path("pos"));
             boolean loaded = isLoaded(pos);
@@ -362,6 +373,49 @@ public final class IoBridge {
         } else { result(callId, "failed", "unsupported_op", null); return; }
         ObjectNode ack = json.createObjectNode(); ack.put("callId", callId); send("body.accepted", ack);
         result(callId, "ok", null, value);
+    }
+
+    private java.util.Optional<net.minecraft.recipe.RecipeEntry<net.minecraft.recipe.SmeltingRecipe>> smeltingRecipe(String input) {
+        var id = net.minecraft.util.Identifier.of("minecraft", input);
+        if (!net.minecraft.registry.Registries.ITEM.containsId(id)) return java.util.Optional.empty();
+        var item = net.minecraft.registry.Registries.ITEM.get(id);
+        return mod.getPlayer().networkHandler.getRecipeManager().getFirstMatch(net.minecraft.recipe.RecipeType.SMELTING,
+                new net.minecraft.recipe.input.SingleStackRecipeInput(new net.minecraft.item.ItemStack(item)), mod.getWorld());
+    }
+
+    private void startSmelt(String callId, JsonNode args) {
+        String inputName = args.path("smeltInput").asText();
+        var recipe = smeltingRecipe(inputName);
+        if (recipe.isEmpty()) { result(callId, "failed", "nothing_smelted", null); return; }
+        var output = recipe.get().value().getResult(mod.getWorld().getRegistryManager()).getItem();
+        String outputName = net.minecraft.registry.Registries.ITEM.getId(output).getPath();
+        if (!outputName.equals(args.path("item").asText())) throw new IllegalArgumentException("smelt product mismatch");
+        var input = net.minecraft.registry.Registries.ITEM.get(net.minecraft.util.Identifier.of("minecraft", inputName));
+        int count = args.path("count").asInt(1);
+        if (count < 1 || count > 64) throw new IllegalArgumentException("invalid smelt count");
+        if (countOf(inputName) < count) { result(callId, "failed", "no_input_item", null); return; }
+        if (args.hasNonNull("fuel")) {
+            String fuelName = args.path("fuel").asText();
+            var id = net.minecraft.util.Identifier.of("minecraft", fuelName);
+            if (!net.minecraft.registry.Registries.ITEM.containsId(id) || countOf(fuelName) < 1) {
+                result(callId, "failed", "no_fuel", null); return;
+            }
+            var fuel = net.minecraft.registry.Registries.ITEM.get(id);
+            if (!adris.altoclef.util.helpers.ItemHelper.isFuel(fuel)
+                    || adris.altoclef.util.helpers.ItemHelper.getFuelAmount(fuel) * countOf(fuelName) < count) { result(callId, "failed", "no_fuel", null); return; }
+            smeltFuel = fuel;
+        }
+        int before = countOf(outputName);
+        var task = new adris.altoclef.tasks.container.SmeltInFurnaceTask(new adris.altoclef.util.SmeltTarget(
+                new ItemTarget(output, before + count), new ItemTarget(input, before + count)));
+        task.ignoreMaterials();
+        PartialSupplier observed = () -> json.createObjectNode().put("input", inputName).put("output", outputName)
+                .put("smelted", countOf(outputName) - before);
+        beginTask(callId, task, () -> {
+            smeltFuel = null;
+            ObjectNode value = observed.get();
+            result(callId, value.path("smelted").asInt() >= count ? "ok" : "failed", null, value);
+        }, observed);
     }
 
     private void startGet(String callId, String item, int count, boolean additional) {
@@ -676,6 +730,8 @@ public final class IoBridge {
             if (cancelling) return;
             if (!callId.equals(runningCallId)) return;
             runningCallId = null;
+            // Publish the postcondition state before settling Core's call.
+            pushState(true);
             onDone.run();
         });
     }
@@ -687,6 +743,7 @@ public final class IoBridge {
             cancelling = true;
             ObjectNode partialValue = currentPartial.get();
             mod.cancelUserTask();
+            smeltFuel = null;
             runningCallId = null;
             out.put("phase", "stopped");
             out.set("partial", partialValue);
