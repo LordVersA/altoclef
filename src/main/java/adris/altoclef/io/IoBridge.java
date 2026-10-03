@@ -314,6 +314,7 @@ public final class IoBridge {
                 case "prim.dig" -> startDig(callId, args);
                 case "prim.place" -> startPlace(callId, args);
                 case "prim.use" -> startEat(callId,args);
+                case "prim.sleep" -> startSleep(callId,args);
                 case "prim.activate" -> {
                     if ("withdraw".equals(args.path("interaction").asText())) startContainerTransfer(callId, args, false);
                     else startObserveContainer(callId, args);
@@ -361,8 +362,12 @@ public final class IoBridge {
             BlockPos pos = readPosition(args.path("pos"));
             boolean loaded = isLoaded(pos);
             value.put("loaded", loaded);
-            if (loaded) value.put("name", net.minecraft.registry.Registries.BLOCK.getId(
-                    mod.getWorld().getBlockState(pos).getBlock()).getPath());
+            if (loaded) {
+                var state=mod.getWorld().getBlockState(pos);
+                value.put("name", Registries.BLOCK.getId(state.getBlock()).getPath());
+                ObjectNode properties=value.putObject("properties");
+                state.getEntries().forEach((property,setting)->properties.put(property.getName(),setting.toString()));
+            }
         } else if ("query.region".equals(op)) {
             BlockPos a = readPosition(args.path("from")), b = readPosition(args.path("to"));
             BlockPos from = new BlockPos(Math.min(a.getX(), b.getX()), Math.min(a.getY(), b.getY()), Math.min(a.getZ(), b.getZ()));
@@ -407,6 +412,16 @@ public final class IoBridge {
                 ObjectNode row = found.addObject().put("name", Registries.BLOCK.getId(mod.getWorld().getBlockState(pos).getBlock()).getPath());
                 row.putObject("pos").put("x",pos.getX()).put("y",pos.getY()).put("z",pos.getZ());
             });
+        } else if ("query.light".equals(op)) {
+            value.put("timeOfDay",Math.floorMod(mod.getWorld().getTimeOfDay(),24000));
+            value.put("thundering",mod.getWorld().isThundering());
+            value.put("bedsWork",mod.getWorld().getDimension().bedWorks());
+            BlockPos pos=args.has("pos") ? readPosition(args.path("pos")) : mod.getPlayer().getBlockPos();
+            value.put("loaded",isLoaded(pos));
+            if (isLoaded(pos)) {
+                value.put("blockLight",mod.getWorld().getLightLevel(net.minecraft.world.LightType.BLOCK,pos));
+                value.put("skyLight",mod.getWorld().getLightLevel(net.minecraft.world.LightType.SKY,pos));
+            }
         } else if ("query.container".equals(op)) {
             var observed = containerSnapshot(args.has("pos") ? readPosition(args.path("pos")) : null);
             if (observed == null) { result(callId,"failed","container_not_open",null); return; }
@@ -466,6 +481,84 @@ public final class IoBridge {
         }
         value.put("emptySlots", slots-used);
         return value;
+    }
+
+    private void startSleep(String callId, JsonNode args) {
+        BlockPos pos=readPosition(args.path("pos"));
+        long duration=args.path("maxDurationMs").asLong(600000);
+        if (duration<1000 || duration>900000) throw new IllegalArgumentException("invalid sleep duration");
+        if (!isLoaded(pos) || !(mod.getWorld().getBlockState(pos).getBlock() instanceof net.minecraft.block.BedBlock)) {
+            result(callId,"failed","no_bed",null); return;
+        }
+        var state=mod.getWorld().getBlockState(pos);
+        if (state.get(net.minecraft.block.BedBlock.PART)==net.minecraft.block.enums.BedPart.HEAD)
+            pos=pos.offset(state.get(net.minecraft.block.BedBlock.FACING).getOpposite());
+        String refusal=sleepRefusal(pos);
+        if (refusal!=null) { result(callId,"failed",refusal,null); return; }
+        var task=new IoSleepTask(pos,duration);
+        beginTask(callId,task,() -> result(callId,task.failure==null ? "ok" : "failed",task.failure,task.value()),task::value);
+    }
+
+    private String sleepRefusal(BlockPos pos) {
+        if (!mod.getWorld().getDimension().bedWorks()) return "bed_unusable";
+        if (!isLoaded(pos) || !(mod.getWorld().getBlockState(pos).getBlock() instanceof net.minecraft.block.BedBlock)) return "bed_unusable";
+        var state=mod.getWorld().getBlockState(pos);
+        BlockPos head=pos.offset(state.get(net.minecraft.block.BedBlock.FACING));
+        if (!isLoaded(head) || !(mod.getWorld().getBlockState(head).getBlock() instanceof net.minecraft.block.BedBlock)) return "bed_unusable";
+        long time=Math.floorMod(mod.getWorld().getTimeOfDay(),24000);
+        if (!mod.getWorld().isThundering() && !(time>=12542 && time<23459)) return "not_night";
+        if (state.get(net.minecraft.block.BedBlock.OCCUPIED) || mod.getWorld().getBlockState(head).get(net.minecraft.block.BedBlock.OCCUPIED)) return "bed_occupied";
+        for (var entity:mod.getWorld().getEntities()) if (entity.isAlive() && entity instanceof net.minecraft.entity.mob.HostileEntity
+                && Math.abs(entity.getX()-head.getX())<=8 && Math.abs(entity.getY()-head.getY())<=5 && Math.abs(entity.getZ()-head.getZ())<=8) return "monsters_nearby";
+        return null;
+    }
+
+    private final class IoSleepTask extends Task {
+        private final BlockPos pos,head;
+        private final long duration;
+        private final Task interact;
+        private long started,sleptAt,sleptMs,occupiedAt;
+        private String failure,wokeBy="morning";
+        private boolean done;
+        IoSleepTask(BlockPos pos,long duration) { this.pos=pos; this.head=pos.offset(mod.getWorld().getBlockState(pos).get(net.minecraft.block.BedBlock.FACING)); this.duration=duration; interact=new adris.altoclef.tasks.InteractWithBlockTask(pos); }
+        private boolean sleepingHere() {
+            var sleeping=mod.getPlayer().getSleepingPosition();
+            return sleeping.isPresent() && (sleeping.get().equals(pos) || sleeping.get().equals(head));
+        }
+        private void wake() {
+            if (mod.getPlayer().isSleeping() && sleepingHere()) mod.getPlayer().networkHandler.sendPacket(
+                new net.minecraft.network.packet.c2s.play.ClientCommandC2SPacket(mod.getPlayer(),net.minecraft.network.packet.c2s.play.ClientCommandC2SPacket.Mode.STOP_SLEEPING));
+        }
+        ObjectNode value() {
+            ObjectNode value=json.createObjectNode().put("slept",sleptAt>0).put("sleptMs",sleptMs).put("wokeBy",wokeBy);
+            value.putObject("bed").put("x",pos.getX()).put("y",pos.getY()).put("z",pos.getZ()); return value;
+        }
+        @Override protected void onStart() { started=System.currentTimeMillis(); StorageHelper.closeScreen(); }
+        @Override protected Task onTick() {
+            long now=System.currentTimeMillis();
+            if (mod.getPlayer().isSleeping()) {
+                mod.getInputControls().release(baritone.api.utils.input.Input.CLICK_RIGHT);
+                if (!sleepingHere()) { failure="bed_occupied"; done=true; return null; }
+                if (sleptAt==0) sleptAt=now;
+                sleptMs=now-sleptAt;
+                if (sleptMs>=duration) { wokeBy="timeout"; wake(); done=true; }
+                return null;
+            }
+            if (sleptAt>0) { sleptMs=now-sleptAt; done=true; return null; }
+            failure=sleepRefusal(pos);
+            if ("bed_occupied".equals(failure)) {
+                // The bed block update can precede the player's sleeping-position packet.
+                if (occupiedAt==0) occupiedAt=now;
+                if (now-occupiedAt<500) { failure=null; return null; }
+            }
+            if (failure!=null) { done=true; return null; }
+            if (now-started>35000) { failure="sleep_refused"; done=true; return null; }
+            return interact;
+        }
+        @Override public boolean isFinished() { return done; }
+        @Override protected void onStop(Task interrupt) { mod.getInputControls().release(baritone.api.utils.input.Input.CLICK_RIGHT); wake(); }
+        @Override protected boolean isEqual(Task other) { return this==other; }
+        @Override protected String toDebugString() { return "IO sleep in existing bed " + pos; }
     }
 
     private void startEat(String callId, JsonNode args) {
