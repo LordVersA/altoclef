@@ -313,6 +313,7 @@ public final class IoBridge {
                 case "prim.equip" -> startEquip(callId, args);
                 case "prim.dig" -> startDig(callId, args);
                 case "prim.place" -> startPlace(callId, args);
+                case "prim.use" -> startEat(callId,args);
                 case "prim.activate" -> {
                     if ("withdraw".equals(args.path("interaction").asText())) startContainerTransfer(callId, args, false);
                     else startObserveContainer(callId, args);
@@ -350,6 +351,8 @@ public final class IoBridge {
             value.put("validItem", Registries.ITEM.containsId(net.minecraft.util.Identifier.of("minecraft", item)));
             value.put("validBlock", Registries.BLOCK.containsId(net.minecraft.util.Identifier.of("minecraft", item))
                     && Registries.ITEM.get(net.minecraft.util.Identifier.of("minecraft", item)) instanceof net.minecraft.item.BlockItem);
+            var food=adris.altoclef.multiversion.item.ItemVer.getFoodComponent(Registries.ITEM.get(net.minecraft.util.Identifier.of("minecraft",item)));
+            value.put("foodPoints",food==null ? 0 : food.getHunger());
             var recipe = smeltingRecipe(item);
             if (recipe.isPresent()) value.put("smeltOutput", net.minecraft.registry.Registries.ITEM.getId(
                     recipe.get().value().getResult(mod.getWorld().getRegistryManager()).getItem()).getPath());
@@ -463,6 +466,81 @@ public final class IoBridge {
         }
         value.put("emptySlots", slots-used);
         return value;
+    }
+
+    private void startEat(String callId, JsonNode args) {
+        if (!"eat".equals(args.path("action").asText())) throw new IllegalArgumentException("unsupported item use");
+        int maxFood=args.path("maxFood").asInt(20), untilFood=args.path("untilFood").asInt(-1);
+        if (maxFood<0 || maxFood>20 || (args.has("untilFood") && (untilFood<1 || untilFood>20)))
+            throw new IllegalArgumentException("invalid hunger threshold");
+        var task=new IoEatTask(maxFood,untilFood);
+        beginTask(callId,task,() -> result(callId,task.failure==null ? "ok" : "failed",task.failure,task.value()),task::value);
+    }
+
+    private final class IoEatTask extends Task implements ITaskRequiresGrounded {
+        private final int maxFood,untilFood;
+        private final java.util.Set<String> unsafe=java.util.Set.of("rotten_flesh","spider_eye","pufferfish","poisonous_potato","suspicious_stew","chicken");
+        private final java.util.Set<String> raw=java.util.Set.of("beef","porkchop","mutton","chicken","rabbit","cod","salmon","potato");
+        private int before,biteBefore,bites,heldBefore;
+        private net.minecraft.item.Item choice;
+        private String ate="",failure;
+        private boolean previousStop,done;
+        private long biteStarted;
+        IoEatTask(int maxFood,int untilFood) { this.maxFood=maxFood; this.untilFood=untilFood; }
+        private int hunger() { return mod.getPlayer().getHungerManager().getFoodLevel(); }
+        private int held(net.minecraft.item.Item item) {
+            int count=0;
+            for (int i=0;i<36;i++) { ItemStack stack=mod.getPlayer().getInventory().getStack(i); if (stack.isOf(item)) count+=stack.getCount(); }
+            return count;
+        }
+        private net.minecraft.item.Item selectFood() {
+            java.util.List<net.minecraft.item.Item> foods=new java.util.ArrayList<>();
+            for (int i=0;i<36;i++) {
+                ItemStack stack=mod.getPlayer().getInventory().getStack(i);
+                var food=adris.altoclef.multiversion.item.ItemVer.getFoodComponent(stack.getItem());
+                if (!stack.isEmpty() && food!=null && food.getHunger()>0 && !unsafe.contains(Registries.ITEM.getId(stack.getItem()).getPath())) foods.add(stack.getItem());
+            }
+            if (foods.stream().anyMatch(item->!raw.contains(Registries.ITEM.getId(item).getPath())))
+                foods.removeIf(item->raw.contains(Registries.ITEM.getId(item).getPath()));
+            int missing=20-hunger();
+            var fits=foods.stream().filter(item->adris.altoclef.multiversion.item.ItemVer.getFoodComponent(item).getHunger()<=missing).toList();
+            var comparator=java.util.Comparator.comparingInt((net.minecraft.item.Item item)->adris.altoclef.multiversion.item.ItemVer.getFoodComponent(item).getHunger());
+            return fits.isEmpty() ? foods.stream().min(comparator).orElse(null) : fits.stream().max(comparator).orElse(null);
+        }
+        ObjectNode value() { return json.createObjectNode().put("ate",ate).put("foodBefore",before).put("foodAfter",hunger()); }
+        @Override protected void onStart() {
+            before=hunger(); previousStop=mod.getFoodChain().isShouldStop(); mod.getFoodChain().shouldStop(true);
+            StorageHelper.closeScreen();
+        }
+        @Override protected Task onTick() {
+            if (before>maxFood && bites==0) { failure="already_full"; done=true; return null; }
+            if (choice!=null && held(choice)<heldBefore && hunger()>biteBefore) {
+                ate=Registries.ITEM.getId(choice).getPath(); bites++; choice=null;
+                mod.getInputControls().release(baritone.api.utils.input.Input.CLICK_RIGHT);
+                mod.getExtraBaritoneSettings().setInteractionPaused(false);
+                if (untilFood<0 || hunger()>=untilFood || bites>=8) { done=true; return null; }
+            }
+            if (choice==null) {
+                choice=selectFood();
+                if (choice==null) { if (bites==0) failure="no_food"; done=true; return null; }
+                if (hunger()>=20) { failure="did_not_eat"; done=true; return null; }
+                biteBefore=hunger(); heldBefore=held(choice); biteStarted=System.currentTimeMillis();
+            }
+            if (System.currentTimeMillis()-biteStarted>6000) { failure="did_not_eat"; done=true; return null; }
+            if (adris.altoclef.util.helpers.LookHelper.tryAvoidingInteractable(mod) && mod.getSlotHandler().forceEquipItem(new net.minecraft.item.Item[]{choice},true)) {
+                mod.getInputControls().hold(baritone.api.utils.input.Input.CLICK_RIGHT);
+                mod.getExtraBaritoneSettings().setInteractionPaused(true);
+            }
+            return null;
+        }
+        @Override public boolean isFinished() { return done; }
+        @Override protected void onStop(Task interrupt) {
+            mod.getInputControls().release(baritone.api.utils.input.Input.CLICK_RIGHT);
+            mod.getExtraBaritoneSettings().setInteractionPaused(false);
+            mod.getFoodChain().shouldStop(previousStop);
+        }
+        @Override protected boolean isEqual(Task other) { return this==other; }
+        @Override protected String toDebugString() { return "IO eat held safe food"; }
     }
 
     private void startPickup(String callId, JsonNode args) {
