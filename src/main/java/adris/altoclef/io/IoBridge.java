@@ -265,6 +265,20 @@ public final class IoBridge {
             send("body.accepted", a);
             return;
         }
+        // Chat must remain usable while a task owns the body (progress, stop, approvals).
+        if ("prim.chat".equals(op)) {
+            String text = args.path("text").asText();
+            if (text.isBlank() || text.length() > 256 || text.startsWith("/") || text.contains("\n") || text.contains("\r")) {
+                result(callId, "failed", "invalid_chat", null);
+                return;
+            }
+            ObjectNode ack = json.createObjectNode();
+            ack.put("callId", callId);
+            send("body.accepted", ack);
+            MinecraftClient.getInstance().player.networkHandler.sendChatMessage(text);
+            result(callId, "ok", null, json.createObjectNode());
+            return;
+        }
         if (runningCallId != null) {
             result(callId, "failed", "busy", null);
             return;
