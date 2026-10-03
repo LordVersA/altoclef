@@ -35,7 +35,8 @@
     "MixinLocalPlayer",
     "PlayerCollidesWithEntityMixin",
     "SimpleOptionMixin",
-    "SmeltFuelMixin"
+    "SmeltFuelMixin",
+    "IoInventoryReceiptMixin"
   ],
   "injectors": {
     "defaultRequire": 1

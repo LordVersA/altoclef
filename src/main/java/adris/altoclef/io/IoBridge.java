@@ -73,6 +73,11 @@ public final class IoBridge {
     private String runningCallId;
     private boolean cancelling;
     private boolean usedCraftingTable;
+    private static net.minecraft.screen.ScreenHandler syncedInventoryHandler;
+    public static void receivedInventory(int syncId) {
+        var player = MinecraftClient.getInstance().player;
+        if (player != null && player.currentScreenHandler.syncId == syncId) syncedInventoryHandler = player.currentScreenHandler;
+    }
     private static net.minecraft.item.Item smeltFuel;
     public static net.minecraft.item.Item selectedSmeltFuel() { return smeltFuel; }
     private long lastStateAt;
@@ -307,6 +312,7 @@ public final class IoBridge {
                 case "prim.equip" -> startEquip(callId, args);
                 case "prim.dig" -> startDig(callId, args);
                 case "prim.place" -> startPlace(callId, args);
+                case "prim.activate" -> startObserveContainer(callId, args);
                 case "task.food" -> startFood(callId, args.path("count").asInt(20));
                 case "task.follow" -> startFollow(callId, args);
                 case "task.give" -> startGive(callId, args);
@@ -367,6 +373,36 @@ public final class IoBridge {
                         mod.getWorld().getBlockState(pos).isSolidBlock(mod.getWorld(), pos));
             }
             value.put("complete", complete);
+        } else if ("query.findBlocks".equals(op)) {
+            int radius = args.path("radius").asInt(16), limit = args.path("limit").asInt(1);
+            if (radius < 1 || radius > 64 || limit < 1 || limit > 64 || !args.path("blocks").isArray()
+                    || args.path("blocks").size() < 1 || args.path("blocks").size() > 32)
+                throw new IllegalArgumentException("invalid bounded block search");
+            java.util.Set<net.minecraft.block.Block> wanted = new java.util.HashSet<>();
+            for (JsonNode name : args.path("blocks")) {
+                var id = net.minecraft.util.Identifier.of("minecraft", name.asText());
+                if (Registries.BLOCK.containsId(id)) wanted.add(Registries.BLOCK.get(id));
+            }
+            var center = args.has("near") ? readPosition(args.path("near")) : mod.getPlayer().getBlockPos();
+            var hits = new java.util.PriorityQueue<BlockPos>(java.util.Comparator.<BlockPos>comparingDouble(pos -> pos.getSquaredDistance(center)).reversed());
+            var loadedChunks = new java.util.HashMap<Long, Boolean>();
+            for (BlockPos pos : BlockPos.iterate(center.add(-radius,-radius,-radius), center.add(radius,radius,radius))) {
+                if (pos.getSquaredDistance(center) > radius * radius) continue;
+                long chunk = net.minecraft.util.math.ChunkPos.toLong(pos.getX() >> 4, pos.getZ() >> 4);
+                if (!loadedChunks.computeIfAbsent(chunk, key -> isLoaded(pos))) continue;
+                if (wanted.contains(mod.getWorld().getBlockState(pos).getBlock())) {
+                    hits.add(pos.toImmutable()); if (hits.size() > limit) hits.poll();
+                }
+            }
+            ArrayNode found = value.putArray("blocks");
+            hits.stream().sorted(java.util.Comparator.comparingDouble(pos -> pos.getSquaredDistance(center))).forEach(pos -> {
+                ObjectNode row = found.addObject().put("name", Registries.BLOCK.getId(mod.getWorld().getBlockState(pos).getBlock()).getPath());
+                row.putObject("pos").put("x",pos.getX()).put("y",pos.getY()).put("z",pos.getZ());
+            });
+        } else if ("query.container".equals(op)) {
+            var observed = containerSnapshot(args.has("pos") ? readPosition(args.path("pos")) : null);
+            if (observed == null) { result(callId,"failed","container_not_open",null); return; }
+            value = observed;
         } else if ("query.entities".equals(op)) {
             ArrayNode entities = value.putArray("entities");
             for (var entity : mod.getWorld().getEntities()) {
@@ -391,6 +427,75 @@ public final class IoBridge {
         var item = net.minecraft.registry.Registries.ITEM.get(id);
         return mod.getPlayer().networkHandler.getRecipeManager().getFirstMatch(net.minecraft.recipe.RecipeType.SMELTING,
                 new net.minecraft.recipe.input.SingleStackRecipeInput(new net.minecraft.item.ItemStack(item)), mod.getWorld());
+    }
+
+    private boolean storageContainer(String name) {
+        return java.util.Set.of("chest","trapped_chest","ender_chest","barrel","shulker_box").contains(name)
+                || name.endsWith("_shulker_box");
+    }
+
+    private ObjectNode containerSnapshot(BlockPos expected) {
+        var handler = mod.getPlayer().currentScreenHandler;
+        if (!(handler instanceof net.minecraft.screen.GenericContainerScreenHandler)
+                && !(handler instanceof net.minecraft.screen.ShulkerBoxScreenHandler)) return null;
+        if (syncedInventoryHandler != handler) return null;
+        var last = mod.getItemStorage().getLastBlockPosInteraction();
+        if (last.isEmpty() || (expected != null && !last.get().equals(expected))) return null;
+        BlockPos pos = last.get();
+        if (!isLoaded(pos)) return null;
+        String name = Registries.BLOCK.getId(mod.getWorld().getBlockState(pos).getBlock()).getPath();
+        if (!storageContainer(name)) return null;
+        int slots = handler.slots.size() - 36, used = 0;
+        ObjectNode value = json.createObjectNode().put("container", name).put("dimension", mod.getWorld().getRegistryKey().getValue().toString());
+        value.putObject("position").put("x",pos.getX()).put("y",pos.getY()).put("z",pos.getZ());
+        ArrayNode contents = value.putArray("contents");
+        for (int i = 0; i < slots; i++) {
+            ItemStack stack = handler.getSlot(i).getStack();
+            if (!stack.isEmpty()) {
+                used++;
+                contents.addObject().put("slot",i).put("name",Registries.ITEM.getId(stack.getItem()).getPath()).put("count",stack.getCount());
+            }
+        }
+        value.put("emptySlots", slots-used);
+        return value;
+    }
+
+    private void startObserveContainer(String callId, JsonNode args) {
+        if (!"observe_container".equals(args.path("interaction").asText()))
+            throw new IllegalArgumentException("unsupported activation");
+        BlockPos pos = readPosition(args.path("pos"));
+        if (!isLoaded(pos)) { result(callId,"failed","container_not_found",null); return; }
+        String name = Registries.BLOCK.getId(mod.getWorld().getBlockState(pos).getBlock()).getPath();
+        if (!storageContainer(name)) { result(callId,"failed","not_a_container",null); return; }
+        var task = new IoObserveContainerTask(pos, name);
+        beginTask(callId,task,() -> result(callId,task.failure == null ? "ok" : "failed",task.failure,task.observed),
+                () -> task.observed == null ? json.createObjectNode() : task.observed.deepCopy());
+    }
+
+    private final class IoObserveContainerTask extends Task implements ITaskRequiresGrounded {
+        private final BlockPos pos;
+        private final String name;
+        private final Task interact;
+        private String failure;
+        private ObjectNode observed;
+        IoObserveContainerTask(BlockPos pos, String name) {
+            this.pos=pos; this.name=name;
+            interact=new adris.altoclef.tasks.InteractWithBlockTask(pos);
+        }
+        @Override protected void onStart() { StorageHelper.closeScreen(); syncedInventoryHandler=null; }
+        @Override protected Task onTick() {
+            if (!isLoaded(pos)) { failure="container_not_found"; return null; }
+            if (!Registries.BLOCK.getId(mod.getWorld().getBlockState(pos).getBlock()).getPath().equals(name)) {
+                failure="not_a_container"; return null;
+            }
+            observed=containerSnapshot(pos);
+            if (observed != null) return null;
+            return interact;
+        }
+        @Override public boolean isFinished() { return failure != null || observed != null; }
+        @Override protected void onStop(Task interrupt) { StorageHelper.closeScreen(); }
+        @Override protected boolean isEqual(Task other) { return this == other; }
+        @Override protected String toDebugString() { return "IO observe container " + pos; }
     }
 
     private void startPlace(String callId, JsonNode args) {
