@@ -1293,6 +1293,11 @@ public final class IoBridge {
         if (!Registries.BLOCK.containsId(id) || !(Registries.ITEM.get(id) instanceof net.minecraft.item.BlockItem)) {
             result(callId, "failed", "unknown_block", null); return;
         }
+        if (args.path("stationary").asBoolean(false)) {
+            var task=new IoStationaryPlaceTask(pos,Registries.BLOCK.get(id),name);
+            beginTask(callId,task,()->result(callId,task.failure==null ? "ok" : "failed",task.failure,task.value()),task::value);
+            return;
+        }
         var task = new IoPlaceTask(pos, Registries.BLOCK.get(id), name);
         PartialSupplier observed = () -> {
             ObjectNode value = json.createObjectNode().put("block", name);
@@ -1300,6 +1305,57 @@ public final class IoBridge {
             return value;
         };
         beginTask(callId, task, () -> result(callId, task.failure == null ? "ok" : "failed", task.failure, observed.get()), observed);
+    }
+
+    /** Place a nearby supported block without asking the builder to climb out of an enclosure. */
+    private final class IoStationaryPlaceTask extends Task {
+        private final BlockPos pos;
+        private final net.minecraft.block.Block block;
+        private final String name;
+        private BlockPos feet;
+        private long started,clicked;
+        private int attempts;
+        private boolean done;
+        private String failure;
+        IoStationaryPlaceTask(BlockPos pos,net.minecraft.block.Block block,String name) { this.pos=pos; this.block=block; this.name=name; }
+        ObjectNode value() {
+            var value=json.createObjectNode().put("block",name);
+            value.putObject("pos").put("x",pos.getX()).put("y",pos.getY()).put("z",pos.getZ()); return value;
+        }
+        @Override protected void onStart() {
+            feet=mod.getPlayer().getBlockPos(); started=System.currentTimeMillis();
+            mod.getClientBaritone().getPathingBehavior().forceCancel(); mod.getBehaviour().push();
+            mod.getBehaviour().addProtectedItems(block.asItem());
+        }
+        @Override protected Task onTick() {
+            if (!feet.equals(mod.getPlayer().getBlockPos())) { failure="place_failed"; done=true; return null; }
+            if (!isLoaded(pos)) { failure="place_failed"; done=true; return null; }
+            var state=mod.getWorld().getBlockState(pos);
+            if (state.isOf(block)) { done=true; return null; }
+            if (!state.isReplaceable() || !state.getFluidState().isEmpty()) { failure="position_occupied"; done=true; return null; }
+            if (mod.getPlayer().getBoundingBox().intersects(new net.minecraft.util.math.Box(pos))) { failure="position_occupied"; done=true; return null; }
+            if (countOf(name)<1) { failure="not_in_inventory"; done=true; return null; }
+            long now=System.currentTimeMillis();
+            if (now-started>3000) { failure="place_failed"; done=true; return null; }
+            if (clicked!=0 && now-clicked<600) return null;
+            if (attempts>=3) { failure="place_failed"; done=true; return null; }
+            for (var direction:net.minecraft.util.math.Direction.values()) {
+                var support=pos.offset(direction);
+                if (!isLoaded(support) || !mod.getWorld().getBlockState(support).isSolidBlock(mod.getWorld(),support)) continue;
+                var face=direction.getOpposite();
+                var hit=net.minecraft.util.math.Vec3d.ofCenter(support).add(face.getOffsetX()*0.5,face.getOffsetY()*0.5,face.getOffsetZ()*0.5);
+                if (mod.getPlayer().getEyePos().squaredDistanceTo(hit)>20.25) continue;
+                if (!mod.getSlotHandler().forceEquipItem(new net.minecraft.item.Item[]{block.asItem()},true)) return null;
+                adris.altoclef.util.helpers.LookHelper.lookAt(mod,hit,false);
+                mod.getController().interactBlock(mod.getPlayer(),net.minecraft.util.Hand.MAIN_HAND,new net.minecraft.util.hit.BlockHitResult(hit,face,support,false));
+                clicked=now; attempts++; return null;
+            }
+            failure="nothing_to_place_against"; done=true; return null;
+        }
+        @Override public boolean isFinished() { return done; }
+        @Override protected void onStop(Task interrupt) { mod.getBehaviour().pop(); mod.getClientBaritone().getPathingBehavior().forceCancel(); }
+        @Override protected boolean isEqual(Task other) { return this==other; }
+        @Override protected String toDebugString() { return "IO stationary place " + pos; }
     }
 
     private final class IoPlaceTask extends Task implements ITaskRequiresGrounded {
