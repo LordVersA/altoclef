@@ -316,7 +316,8 @@ public final class IoBridge {
                 case "prim.use" -> startEat(callId,args);
                 case "prim.sleep" -> startSleep(callId,args);
                 case "prim.activate" -> {
-                    if ("withdraw".equals(args.path("interaction").asText())) startContainerTransfer(callId, args, false);
+                    if ("use_door".equals(args.path("interaction").asText())) startDoor(callId,args);
+                    else if ("withdraw".equals(args.path("interaction").asText())) startContainerTransfer(callId, args, false);
                     else startObserveContainer(callId, args);
                 }
                 case "task.deposit" -> startContainerTransfer(callId, args, true);
@@ -366,7 +367,7 @@ public final class IoBridge {
                 var state=mod.getWorld().getBlockState(pos);
                 value.put("name", Registries.BLOCK.getId(state.getBlock()).getPath());
                 ObjectNode properties=value.putObject("properties");
-                state.getEntries().forEach((property,setting)->properties.put(property.getName(),setting.toString()));
+                state.getEntries().forEach((property,setting)->properties.put(property.getName(),setting instanceof net.minecraft.util.StringIdentifiable named ? named.asString() : setting.toString()));
             }
         } else if ("query.region".equals(op)) {
             BlockPos a = readPosition(args.path("from")), b = readPosition(args.path("to"));
@@ -481,6 +482,115 @@ public final class IoBridge {
         }
         value.put("emptySlots", slots-used);
         return value;
+    }
+
+    private void startDoor(String callId, JsonNode args) {
+        BlockPos pos=readPosition(args.path("pos"));
+        if (!isLoaded(pos) || !(mod.getWorld().getBlockState(pos).getBlock() instanceof net.minecraft.block.DoorBlock)) {
+            result(callId,"failed","not_a_door",null); return;
+        }
+        var state=mod.getWorld().getBlockState(pos);
+        if (state.get(net.minecraft.block.DoorBlock.HALF)==net.minecraft.block.enums.DoubleBlockHalf.UPPER) pos=pos.down();
+        if (!isLoaded(pos) || !(mod.getWorld().getBlockState(pos).getBlock() instanceof net.minecraft.block.DoorBlock)) {
+            result(callId,"failed","not_a_door",null); return;
+        }
+        String name=Registries.BLOCK.getId(mod.getWorld().getBlockState(pos).getBlock()).getPath();
+        if (name.equals("iron_door")) { result(callId,"failed","needs_redstone",null); return; }
+        var task=new IoDoorTask(pos,name,args.path("close").asBoolean(true));
+        beginTask(callId,task,() -> result(callId,task.failure==null ? "ok" : "failed",task.failure,task.value()),task::value);
+    }
+
+    private final class IoDoorTask extends Task implements ITaskRequiresGrounded {
+        private final BlockPos pos;
+        private final String name,axis;
+        private final boolean close;
+        private int side,phase;
+        private BlockPos near,far;
+        private Task movement;
+        private long phaseStarted,lastClick;
+        private boolean oldBreak,oldPlace,done,flipped;
+        private String failure;
+        IoDoorTask(BlockPos pos,String name,boolean close) {
+            this.pos=pos; this.name=name; this.close=close;
+            var facing=mod.getWorld().getBlockState(pos).get(net.minecraft.block.DoorBlock.FACING);
+            axis=facing.getAxis()==net.minecraft.util.math.Direction.Axis.Z ? "z" : "x";
+            side=(axis.equals("z") ? mod.getPlayer().getZ()<pos.getZ()+0.5 : mod.getPlayer().getX()<pos.getX()+0.5) ? -1 : 1;
+            near=offset(side); far=offset(-side); movement=new GetToBlockTask(near);
+        }
+        private BlockPos offset(int side) { return axis.equals("z") ? pos.add(0,0,side) : pos.add(side,0,0); }
+        private int sideNow() { return (axis.equals("z") ? mod.getPlayer().getZ()<pos.getZ()+0.5 : mod.getPlayer().getX()<pos.getX()+0.5) ? -1 : 1; }
+        private boolean reached(BlockPos target) {
+            return Math.hypot(mod.getPlayer().getX()-target.getX()-0.5,mod.getPlayer().getZ()-target.getZ()-0.5)<0.7
+                && Math.abs(mod.getPlayer().getY()-target.getY())<0.5;
+        }
+        private boolean standable(BlockPos target) {
+            return isLoaded(target) && isLoaded(target.up()) && isLoaded(target.down())
+                && mod.getWorld().getBlockState(target).getCollisionShape(mod.getWorld(),target).isEmpty()
+                && mod.getWorld().getBlockState(target.up()).getCollisionShape(mod.getWorld(),target.up()).isEmpty()
+                && mod.getWorld().getBlockState(target.down()).isSolidBlock(mod.getWorld(),target.down());
+        }
+        private boolean setOpen(boolean open) {
+            if (mod.getWorld().getBlockState(pos).get(net.minecraft.block.DoorBlock.OPEN)==open) return true;
+            if (System.currentTimeMillis()-lastClick>=500 && mod.getPlayer().squaredDistanceTo(net.minecraft.util.math.Vec3d.ofCenter(pos))<=20.25) {
+                mod.getController().interactBlock(mod.getPlayer(),net.minecraft.util.Hand.MAIN_HAND,
+                    new net.minecraft.util.hit.BlockHitResult(net.minecraft.util.math.Vec3d.ofCenter(pos),net.minecraft.util.math.Direction.UP,pos,false));
+                lastClick=System.currentTimeMillis();
+            }
+            return false;
+        }
+        private void next(int phase) { this.phase=phase; phaseStarted=System.currentTimeMillis(); }
+        ObjectNode value() {
+            ObjectNode value=json.createObjectNode().put("axis",axis).put("from",side).put("to",sideNow());
+            value.putObject("door").put("x",pos.getX()).put("y",pos.getY()).put("z",pos.getZ()); return value;
+        }
+        @Override protected void onStart() {
+            var settings=mod.getClientBaritoneSettings(); oldBreak=settings.allowBreak.value; oldPlace=settings.allowPlace.value;
+            mod.getBehaviour().push(); mod.getBehaviour().avoidBlockBreaking(p->true);
+            settings.allowBreak.value=false; settings.allowPlace.value=false; phaseStarted=System.currentTimeMillis();
+        }
+        @Override protected Task onTick() {
+            if (!isLoaded(pos) || !Registries.BLOCK.getId(mod.getWorld().getBlockState(pos).getBlock()).getPath().equals(name)) {
+                failure="not_a_door"; done=true; return null;
+            }
+            if (!standable(near) || !standable(far)) { failure="door_blocked"; done=true; return null; }
+            long elapsed=System.currentTimeMillis()-phaseStarted;
+            if (phase==0) {
+                if (reached(near)) { next(1); return null; }
+                if (elapsed>18000) {
+                    if (!flipped) { flipped=true; BlockPos swap=near; near=far; far=swap; side=-side; movement=new GetToBlockTask(near); next(0); }
+                    else { failure="unreachable"; done=true; }
+                }
+                return movement;
+            }
+            if (phase==1) {
+                if (setOpen(true)) { next(2); return null; }
+                if (elapsed>2500) { failure="door_wont_open"; done=true; } return null;
+            }
+            if (phase==2) {
+                if (reached(far) && sideNow()!=side) {
+                    mod.getInputControls().release(baritone.api.utils.input.Input.MOVE_FORWARD);
+                    next(3); return null;
+                }
+                if (elapsed>5000) { failure="door_blocked"; done=true; return null; }
+                mod.getPlayer().setYaw(axis.equals("x") ? (side<0 ? -90 : 90) : (side<0 ? 0 : 180));
+                mod.getPlayer().setPitch(0);
+                mod.getInputControls().hold(baritone.api.utils.input.Input.MOVE_FORWARD);
+                return null;
+            }
+            if (!close || setOpen(false)) { done=true; return null; }
+            if (elapsed>2500) { failure="door_wont_close"; done=true; } return null;
+        }
+        @Override public boolean isFinished() { return done; }
+        @Override protected void onStop(Task interrupt) {
+            mod.getClientBaritone().getPathingBehavior().forceCancel();
+            mod.getInputControls().release(baritone.api.utils.input.Input.CLICK_RIGHT);
+            mod.getInputControls().release(baritone.api.utils.input.Input.MOVE_FORWARD);
+            mod.getBehaviour().pop();
+            mod.getClientBaritoneSettings().allowBreak.value=oldBreak;
+            mod.getClientBaritoneSettings().allowPlace.value=oldPlace;
+        }
+        @Override protected boolean isEqual(Task other) { return this==other; }
+        @Override protected String toDebugString() { return "IO use existing door " + pos; }
     }
 
     private void startSleep(String callId, JsonNode args) {
