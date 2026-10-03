@@ -265,6 +265,12 @@ public final class IoBridge {
             send("body.accepted", a);
             return;
         }
+        if (op.startsWith("query.")) {
+            try { query(callId, op, args); }
+            catch (Exception e) { result(callId, "error", String.valueOf(e), null); }
+            return;
+        }
+
         // Chat must remain usable while a task owns the body (progress, stop, approvals).
         if ("prim.chat".equals(op)) {
             String text = args.path("text").asText();
@@ -303,6 +309,49 @@ public final class IoBridge {
             runningCallId = null;
             result(callId, "error", String.valueOf(e), null);
         }
+    }
+
+    private boolean isLoaded(BlockPos pos) {
+        // ClientWorld can supply EmptyChunk/void_air for absent chunks. Never create one here.
+        return mod.getWorld().getChunkManager().getChunk(pos.getX() >> 4, pos.getZ() >> 4,
+                net.minecraft.world.chunk.ChunkStatus.FULL, false) != null;
+    }
+
+    /** Read-only observations do not compete with the active task. Unloaded blocks stay absent. */
+    private void query(String callId, String op, JsonNode args) {
+        ObjectNode value = json.createObjectNode();
+        if ("query.blockAt".equals(op)) {
+            BlockPos pos = readPosition(args.path("pos"));
+            boolean loaded = isLoaded(pos);
+            value.put("loaded", loaded);
+            if (loaded) value.put("name", net.minecraft.registry.Registries.BLOCK.getId(
+                    mod.getWorld().getBlockState(pos).getBlock()).getPath());
+        } else if ("query.region".equals(op)) {
+            BlockPos a = readPosition(args.path("from")), b = readPosition(args.path("to"));
+            BlockPos from = new BlockPos(Math.min(a.getX(), b.getX()), Math.min(a.getY(), b.getY()), Math.min(a.getZ(), b.getZ()));
+            BlockPos to = new BlockPos(Math.max(a.getX(), b.getX()), Math.max(a.getY(), b.getY()), Math.max(a.getZ(), b.getZ()));
+            long volume = ((long) to.getX() - from.getX() + 1) * ((long) to.getY() - from.getY() + 1) * ((long) to.getZ() - from.getZ() + 1);
+            if (volume > 32768) throw new IllegalArgumentException("query region exceeds 32768 blocks");
+            ObjectNode blocks = value.putObject("blocks");
+            boolean complete = true;
+            for (BlockPos pos : BlockPos.iterate(from, to)) {
+                if (!isLoaded(pos)) { complete = false; continue; }
+                blocks.put(pos.getX() + "," + pos.getY() + "," + pos.getZ(), net.minecraft.registry.Registries.BLOCK.getId(
+                        mod.getWorld().getBlockState(pos).getBlock()).getPath());
+            }
+            value.put("complete", complete);
+        } else if ("query.entities".equals(op)) {
+            ArrayNode entities = value.putArray("entities");
+            for (var entity : mod.getWorld().getEntities()) {
+                ObjectNode entry = entities.addObject();
+                entry.put("id", String.valueOf(entity.getId()));
+                entry.put("type", net.minecraft.registry.Registries.ENTITY_TYPE.getId(entity.getType()).getPath());
+                ObjectNode pos = entry.putObject("pos");
+                pos.put("x", entity.getX()); pos.put("y", entity.getY()); pos.put("z", entity.getZ());
+            }
+        } else { result(callId, "failed", "unsupported_op", null); return; }
+        ObjectNode ack = json.createObjectNode(); ack.put("callId", callId); send("body.accepted", ack);
+        result(callId, "ok", null, value);
     }
 
     private void startGet(String callId, String item, int count) {
@@ -513,7 +562,7 @@ public final class IoBridge {
         private int mismatches() {
             int count = 0;
             for (BlockPos pos : BlockPos.iterate(from, to)) {
-                if (!mod.getWorld().isChunkLoaded(pos)) { count++; continue; }
+                if (!isLoaded(pos)) { count++; continue; }
                 var actual = mod.getWorld().getBlockState(pos);
                 if (schematic == null ? !actual.isAir() : !actual.equals(schematic.getDirect(
                         pos.getX() - from.getX(), pos.getY() - from.getY(), pos.getZ() - from.getZ()))) count++;
