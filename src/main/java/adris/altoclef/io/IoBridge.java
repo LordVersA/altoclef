@@ -319,7 +319,8 @@ public final class IoBridge {
                 }
                 case "prim.sleep" -> startSleep(callId,args);
                 case "prim.activate" -> {
-                    if ("clear_furnace".equals(args.path("interaction").asText())) startClearFurnace(callId,args);
+                    if ("escape_liquid".equals(args.path("interaction").asText())) startEscapeLiquid(callId,args);
+                    else if ("clear_furnace".equals(args.path("interaction").asText())) startClearFurnace(callId,args);
                     else if ("use_door".equals(args.path("interaction").asText())) startDoor(callId,args);
                     else if ("withdraw".equals(args.path("interaction").asText())) startContainerTransfer(callId, args, false);
                     else startObserveContainer(callId, args);
@@ -493,6 +494,84 @@ public final class IoBridge {
         }
         value.put("emptySlots", slots-used);
         return value;
+    }
+
+    private String liquidAtPlayer() {
+        BlockPos feet=mod.getPlayer().getBlockPos();
+        for (var pos:new BlockPos[]{feet,feet.up()}) {
+            if (!isLoaded(pos)) return "unknown";
+            var block=mod.getWorld().getBlockState(pos).getBlock();
+            if (block==Blocks.WATER) return "water";
+            if (block==Blocks.LAVA) return "lava";
+        }
+        return null;
+    }
+    private boolean dryStand(BlockPos pos) {
+        if (!isLoaded(pos) || !isLoaded(pos.down()) || !isLoaded(pos.up())) return false;
+        var ground=mod.getWorld().getBlockState(pos.down());
+        if (!ground.isSolidBlock(mod.getWorld(),pos.down()) || ground.isOf(Blocks.MAGMA_BLOCK)) return false;
+        for (var p:new BlockPos[]{pos,pos.up()}) {
+            var state=mod.getWorld().getBlockState(p);
+            if (!state.getCollisionShape(mod.getWorld(),p).isEmpty() || !state.getFluidState().isEmpty()
+                    || state.isOf(Blocks.FIRE) || state.isOf(Blocks.SOUL_FIRE)) return false;
+        }
+        return true;
+    }
+    private void startEscapeLiquid(String callId,JsonNode args) {
+        int radius=args.path("searchRadius").asInt(8);
+        if (radius<2 || radius>32) throw new IllegalArgumentException("invalid escape radius");
+        String liquid=liquidAtPlayer();
+        if (liquid==null) { result(callId,"failed","not_in_liquid",null); return; }
+        if (liquid.equals("unknown")) { result(callId,"failed","body_observation_unavailable",null); return; }
+        var origin=mod.getPlayer().getBlockPos(); BlockPos exit=null;
+        search: for (int r=1;r<=radius;r++) for (int dx=-r;dx<=r;dx++) for (int dz=-r;dz<=r;dz++) {
+            if (Math.max(Math.abs(dx),Math.abs(dz))!=r) continue;
+            for (int dy=-2;dy<=3;dy++) {
+                var pos=origin.add(dx,dy,dz);
+                if (dryStand(pos)) { exit=pos; break search; }
+            }
+        }
+        if (exit==null) { result(callId,"failed","no_safe_ground",null); return; }
+        var task=new IoEscapeLiquidTask(liquid,exit);
+        beginTask(callId,task,()->result(callId,task.failure==null ? "ok" : "failed",task.failure,task.value()),task::value);
+    }
+    private final class IoEscapeLiquidTask extends Task {
+        private final String liquid;
+        private final BlockPos exit;
+        private long started;
+        private boolean done,oldBreak,oldPlace,oldParkour;
+        private int oldFall;
+        private String failure;
+        IoEscapeLiquidTask(String liquid,BlockPos exit) { this.liquid=liquid; this.exit=exit; }
+        ObjectNode value() {
+            var value=json.createObjectNode().put("liquid",liquid);
+            value.putObject("escapedTo").put("x",exit.getX()).put("y",exit.getY()).put("z",exit.getZ());
+            return value;
+        }
+        @Override protected void onStart() {
+            started=System.currentTimeMillis(); mod.getBehaviour().push(); mod.getBehaviour().avoidBlockBreaking(p->true);
+            var settings=mod.getClientBaritoneSettings(); oldBreak=settings.allowBreak.value; oldPlace=settings.allowPlace.value;
+            oldFall=settings.maxFallHeightNoWater.value; oldParkour=settings.allowParkour.value;
+            settings.allowBreak.value=false; settings.allowPlace.value=false; settings.maxFallHeightNoWater.value=3; settings.allowParkour.value=false;
+            mod.getClientBaritone().getPathingBehavior().forceCancel();
+        }
+        @Override protected Task onTick() {
+            if (liquidAtPlayer()==null && mod.getPlayer().squaredDistanceTo(net.minecraft.util.math.Vec3d.ofBottomCenter(exit))<4) { done=true; return null; }
+            if (!dryStand(exit)) { failure="no_safe_ground"; done=true; return null; }
+            if (System.currentTimeMillis()-started>30000) { failure="still_in_liquid"; done=true; return null; }
+            mod.getInputControls().hold(baritone.api.utils.input.Input.JUMP);
+            if (!mod.getClientBaritone().getCustomGoalProcess().isActive())
+                mod.getClientBaritone().getCustomGoalProcess().setGoalAndPath(new baritone.api.pathing.goals.GoalBlock(exit));
+            return null;
+        }
+        @Override public boolean isFinished() { return done; }
+        @Override protected void onStop(Task interrupt) {
+            mod.getInputControls().release(baritone.api.utils.input.Input.JUMP); mod.getClientBaritone().getPathingBehavior().forceCancel();
+            mod.getBehaviour().pop(); var settings=mod.getClientBaritoneSettings();
+            settings.allowBreak.value=oldBreak; settings.allowPlace.value=oldPlace; settings.maxFallHeightNoWater.value=oldFall; settings.allowParkour.value=oldParkour;
+        }
+        @Override protected boolean isEqual(Task other) { return this==other; }
+        @Override protected String toDebugString() { return "IO escape " + liquid + " onto dry ground"; }
     }
 
     private void startUseOn(String callId,JsonNode args) {
