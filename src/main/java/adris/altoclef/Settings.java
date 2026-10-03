@@ -85,7 +85,7 @@ public class Settings implements IFailableConfigFile {
     /**
      * When logging to chat, will prepend this to each log.
      */
-    private String chatLogPrefix = "[Alto Clef] ";
+    private String chatLogPrefix = "";
 
     /**
      * If true, will show a timer.
@@ -365,7 +365,7 @@ public class Settings implements IFailableConfigFile {
      * <p>
      * Careful with this! If true, any item not in "importantItems" is liable to be thrown away.
      */
-    private boolean throwAwayUnusedItems = true;
+    private boolean throwAwayUnusedItems = false;
 
     /**
      * We will NEVER throw away these items.

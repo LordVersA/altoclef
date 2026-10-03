@@ -1,0 +1,5 @@
+{
+  "useButlerWhitelist": true,
+  "useButlerBlacklist": true,
+  "whisperFormatDebug": false
+}

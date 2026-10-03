@@ -1,0 +1,7 @@
+{
+  "throwAwayUnusedItems": false,
+  "dontThrowAwayCustomNameItems": true,
+  "dontThrowAwayEnchantedItems": true,
+  "areasToProtect": [],
+  "chatLogPrefix": ""
+}
