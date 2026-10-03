@@ -321,7 +321,8 @@ public final class IoBridge {
                 }
                 case "prim.sleep" -> startSleep(callId,args);
                 case "prim.activate" -> {
-                    if ("escape_liquid".equals(args.path("interaction").asText())) startEscapeLiquid(callId,args);
+                    if ("flee_from".equals(args.path("interaction").asText())) startFlee(callId,args);
+                    else if ("escape_liquid".equals(args.path("interaction").asText())) startEscapeLiquid(callId,args);
                     else if ("clear_furnace".equals(args.path("interaction").asText())) startClearFurnace(callId,args);
                     else if ("use_door".equals(args.path("interaction").asText())) startDoor(callId,args);
                     else if ("withdraw".equals(args.path("interaction").asText())) startContainerTransfer(callId, args, false);
@@ -442,6 +443,7 @@ public final class IoBridge {
                 ObjectNode entry = entities.addObject();
                 entry.put("id", String.valueOf(entity.getId()));
                 entry.put("uuid",entity.getUuid().toString()); entry.put("alive",entity.isAlive());
+                entry.put("hostile",entity instanceof net.minecraft.entity.mob.HostileEntity || entity instanceof net.minecraft.entity.mob.SlimeEntity || entity instanceof net.minecraft.entity.mob.PhantomEntity);
                 if (entity instanceof net.minecraft.entity.passive.SheepEntity sheep) entry.put("sheared",sheep.isSheared());
                 if (entity instanceof net.minecraft.entity.player.PlayerEntity player) {
                     entry.put("username", player.getName().getString());
@@ -496,6 +498,63 @@ public final class IoBridge {
         }
         value.put("emptySlots", slots-used);
         return value;
+    }
+
+    private void startFlee(String callId,JsonNode args) {
+        int entityId=args.path("entityId").asInt(-1); UUID uuid=UUID.fromString(args.path("entityUuid").asText());
+        double distance=args.path("distance").asDouble(16);
+        if (!Double.isFinite(distance) || distance<4 || distance>64) throw new IllegalArgumentException("invalid flee distance");
+        var entity=mod.getWorld().getEntityById(entityId);
+        if (entity==null || entity==mod.getPlayer() || !entity.isAlive() || !entity.getUuid().equals(uuid)) { result(callId,"failed","no_threat_found",null); return; }
+        BlockPos lead=args.has("lead") ? readPosition(args.path("lead")) : null;
+        var task=new IoFleeTask(entity,uuid,distance,lead);
+        beginTask(callId,task,()->result(callId,task.failure==null ? "ok" : "failed",task.failure,task.value()),task::value);
+    }
+    private final class IoFleeTask extends Task {
+        private final net.minecraft.entity.Entity entity;
+        private final UUID uuid;
+        private final double distance;
+        private final BlockPos lead;
+        private baritone.api.pathing.goals.Goal goal;
+        private net.minecraft.util.math.Vec3d lastTarget,lastPlayer;
+        private long started,movedAt;
+        private boolean done,gone,oldBreak,oldPlace,oldParkour;
+        private int oldFall;
+        private String failure;
+        IoFleeTask(net.minecraft.entity.Entity entity,UUID uuid,double distance,BlockPos lead) { this.entity=entity; this.uuid=uuid; this.distance=distance; this.lead=lead; lastTarget=entity.getPos(); }
+        private boolean live() { return entity.isAlive() && mod.getWorld().getEntityById(entity.getId())==entity && entity.getUuid().equals(uuid); }
+        ObjectNode value() { return json.createObjectNode().put("entityUuid",uuid.toString()).put("gone",gone).put("finalDistance",mod.getPlayer().getPos().distanceTo(lastTarget)); }
+        @Override protected void onStart() {
+            started=System.currentTimeMillis(); movedAt=started; lastPlayer=mod.getPlayer().getPos();
+            mod.getBehaviour().push(); mod.getBehaviour().avoidBlockBreaking(p->true);
+            var settings=mod.getClientBaritoneSettings(); oldBreak=settings.allowBreak.value; oldPlace=settings.allowPlace.value;
+            oldParkour=settings.allowParkour.value; oldFall=settings.maxFallHeightNoWater.value;
+            settings.allowBreak.value=false; settings.allowPlace.value=false; settings.allowParkour.value=false; settings.maxFallHeightNoWater.value=3;
+            mod.getClientBaritone().getPathingBehavior().forceCancel();
+            goal=lead!=null ? new baritone.api.pathing.goals.GoalXZ(lead.getX(),lead.getZ()) : new adris.altoclef.util.baritone.GoalRunAwayFromEntities(mod,distance+1,false,10) {
+                @Override protected java.util.List<net.minecraft.entity.Entity> getEntities(AltoClef mod) { return live() ? java.util.List.of(entity) : java.util.List.of(); }
+            };
+        }
+        @Override protected Task onTick() {
+            long now=System.currentTimeMillis(); gone=!live();
+            if (!gone) lastTarget=entity.getPos();
+            if (gone || mod.getPlayer().getPos().distanceTo(lastTarget)>=distance+0.5) { done=true; return null; }
+            // Creeper lead segments return after a second so Core can refresh nearby built blocks.
+            if (lead!=null && now-started>=1000) { done=true; return null; }
+            if (mod.getPlayer().getPos().distanceTo(lastPlayer)>0.4) { lastPlayer=mod.getPlayer().getPos(); movedAt=now; }
+            else if (now-movedAt>5000) { failure="cornered"; done=true; return null; }
+            if (now-started>55000) { failure="cornered"; done=true; return null; }
+            if (!mod.getClientBaritone().getCustomGoalProcess().isActive()) mod.getClientBaritone().getCustomGoalProcess().setGoalAndPath(goal);
+            return null;
+        }
+        @Override public boolean isFinished() { return done; }
+        @Override protected void onStop(Task interrupt) {
+            mod.getClientBaritone().getPathingBehavior().forceCancel(); mod.getBehaviour().pop();
+            var settings=mod.getClientBaritoneSettings(); settings.allowBreak.value=oldBreak; settings.allowPlace.value=oldPlace;
+            settings.allowParkour.value=oldParkour; settings.maxFallHeightNoWater.value=oldFall;
+        }
+        @Override protected boolean isEqual(Task other) { return this==other; }
+        @Override protected String toDebugString() { return "IO flee UUID-bound entity"; }
     }
 
     private String liquidAtPlayer() {
