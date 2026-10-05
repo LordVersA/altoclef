@@ -157,8 +157,10 @@ public class WorldSurvivalChain extends SingleTaskChain {
     }
 
     private boolean isStuckInNetherPortal() {
+        // With no user task running there is no current task: the chains now run while the body is idle (IO, O1.5).
+        var current = AltoClef.getInstance().getUserTaskChain().getCurrentTask();
         return WorldHelper.isInNetherPortal()
-                && !AltoClef.getInstance().getUserTaskChain().getCurrentTask().thisOrChildSatisfies(task -> task instanceof EnterNetherPortalTask);
+                && (current == null || !current.thisOrChildSatisfies(task -> task instanceof EnterNetherPortalTask));
     }
 
     @Override

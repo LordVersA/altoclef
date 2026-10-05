@@ -9,7 +9,7 @@ Keep in mind this project is still in rapid development. A lot of features are p
 Commands are prefixed with `@`. Here's a list along with their functions:
 
 | command                | description                                                                                                            | examples      |
-|------------------------|------------------------------------------------------------------------------------------------------------------------|---------------|
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------- | ------------- |
 | `help`                 | Lists all commands                                                                                                     |               |
 | `gamer`                | Beats the game epic style                                                                                              | `@gamer`      |
 | `reload_settings`      | Reloads the local settings file. Run this every time you want your settings to be updated.                             |               |
@@ -19,20 +19,19 @@ Commands are prefixed with `@`. Here's a list along with their functions:
 | `stop`                 | Forcefully stops the currently running command. The shortcut `CTRL+K` also achieves this.                              |               |
 | `test {testname}`      | Runs a "test" command. These vary, and will be described below.                                                        |               |
 
-
 ### Notable test commands
 
 Test commands are temporary/only exist as an experiment, but some of these might be interesting.
 For example, `@test terminate` runs the terminator.
 Here's a list of some highlights.
 
-**note** *this list doesn't include all the test tasks, but it is not my priority to update it...*
+**note** _this list doesn't include all the test tasks, but it is not my priority to update it..._
 
 | test name   | what it does                                                                                                                                                                                                                                                                                         |
-|-------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `terminate` | Runs the terminator task. When without diamond gear, the bot flees players and obtains diamond gear + food. When diamond gear is equipped, the bot hunts any nearby players down and searches for any chunks that were last seen to have players in them.                                            |
 | `deadmeme`  | Expects a file to exist in your `.minecraft` directory called `test.txt`. Reads from this file, then displays the text contents of the file by placing signs in a line. Dubbed the "Bee Movie Task" for stupid reasons. Will automatically collect signs and building materials if the bot runs out. |
-| `173`       | Attacks any player that doesn't have direct line of sight to the bot and stands still otherwise. Like a weeping angel.                                                                                                                                                                               | 
+| `173`       | Attacks any player that doesn't have direct line of sight to the bot and stands still otherwise. Like a weeping angel.                                                                                                                                                                               |
 | `replace`   | Replace grass block within around 100 blocks with crafting tables. Frequently fails when replacing grass blocks next to water.                                                                                                                                                                       |
 | `piglin`    | Collects 12 ender pearls via piglin bartering.                                                                                                                                                                                                                                                       |
 | `stacked`   | Collects diamond armor, a sword and a crafting table.                                                                                                                                                                                                                                                |

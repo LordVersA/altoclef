@@ -629,7 +629,18 @@ public class Settings implements IFailableConfigFile {
         return supportedFuels.toArray(Item[]::new);
     }
 
+    /** Core's protected regions, as the first line of defence: AltoClef's own planning then avoids them. */
+    public void setAreasToProtect(List<BlockRange> areas) {
+        areasToProtect = List.copyOf(areas);
+    }
+
     public boolean isPositionExplicitlyProtected(BlockPos pos) {
+        // Core's policy decides too (O1.6): what it forbids breaking or placing is off the table for every search and path.
+        var policy = adris.altoclef.io.IoPolicy.current();
+        var world = net.minecraft.client.MinecraftClient.getInstance().world;
+        if (policy != null && world != null && world.isChunkLoaded(pos)
+                && policy.breakRefusal(pos, world.getBlockState(pos).getBlock(), world.getRegistryKey().getValue().toString()) != null)
+            return true;
         if (!areasToProtect.isEmpty()) {
             for (BlockRange protection : areasToProtect) {
                 if (protection.contains(pos)) return true;

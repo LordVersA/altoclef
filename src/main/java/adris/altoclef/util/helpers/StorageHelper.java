@@ -599,7 +599,8 @@ public class StorageHelper {
         }
         // Consider Cursor slot only if we have our player inventory open AND we're not crafting it...
         if (StorageHelper.isPlayerInventoryOpen() && withItem.matches(getItemStackInCursorSlot().getItem())) {
-            if (!mod.getUserTaskChain().getCurrentTask().thisOrChildSatisfies(task -> {
+            var userTask = mod.getUserTaskChain().getCurrentTask();
+            if (userTask == null || !userTask.thisOrChildSatisfies(task -> {
                 if (task instanceof CraftInInventoryTask invCraft) {
                     return withItem.matches(invCraft.getRecipeTarget().getOutputItem());
                 }

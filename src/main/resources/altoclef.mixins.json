@@ -36,7 +36,10 @@
     "PlayerCollidesWithEntityMixin",
     "SimpleOptionMixin",
     "SmeltFuelMixin",
-    "IoInventoryReceiptMixin"
+    "IoInventoryReceiptMixin",
+    "IoPolicyMixin",
+    "IoPolicyDropMixin",
+    "IoPickupMixin"
   ],
   "injectors": {
     "defaultRequire": 1

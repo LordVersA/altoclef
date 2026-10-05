@@ -13,6 +13,8 @@ public class TaskRunner {
 
     private TaskChain cachedCurrentTaskChain = null;
 
+    private float cachedCurrentPriority = Float.NEGATIVE_INFINITY;
+
     public String statusReport = " (no chain running) ";
 
     public TaskRunner(AltoClef mod) {
@@ -41,6 +43,7 @@ public class TaskRunner {
             cachedCurrentTaskChain.onInterrupt(maxChain);
         }
         cachedCurrentTaskChain = maxChain;
+        cachedCurrentPriority = maxPriority;
         if (maxChain != null) {
             statusReport = "Chain: "+maxChain.getName() + ", priority: "+maxPriority;
             maxChain.tick();
@@ -74,6 +77,14 @@ public class TaskRunner {
 
     public boolean isActive() {
         return active;
+    }
+
+    /**
+     * How high the chain in charge bid this tick. A chain with nothing to do bids 0 (Mob Defense does, with no mob
+     * about), and wins by default when no user task runs: that is an idle chain, not one acting.
+     */
+    public float getCurrentPriority() {
+        return cachedCurrentPriority;
     }
 
     public TaskChain getCurrentTaskChain() {

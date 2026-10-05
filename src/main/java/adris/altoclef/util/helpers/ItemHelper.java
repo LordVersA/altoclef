@@ -376,7 +376,7 @@ public class ItemHelper {
                         || b == Blocks.NETHER_SPROUTS;
     }
 
-    private static boolean isStackProtected(AltoClef mod, ItemStack stack) {
+    public static boolean isStackProtected(AltoClef mod, ItemStack stack) {
         if (stack.hasEnchantments() && mod.getModSettings().getDontThrowAwayEnchantedItems())
             return true;
         if (ItemVer.hasCustomName(stack) && mod.getModSettings().getDontThrowAwayCustomNameItems())

@@ -86,11 +86,56 @@ public final class IoBridge {
     private boolean enabledForRespawn;
     private final Map<String, JsonNode> finished = new HashMap<>();
 
+    private static volatile IoBridge instance;
+    /** Reported at an action boundary when the policy refused something (6.7). Safe to call from any hook. */
+    public static void policyBlocked(String boundary,String reason,String detail) {
+        var bridge=instance; if (bridge!=null) bridge.reportBlocked(boundary,reason,detail);
+    }
+    /** What is acting: the chain in charge, else the running call, else nothing of Core's. */
+    public static String actingSource() {
+        var bridge=instance; if (bridge==null) return "unknown";
+        if (bridge.chainNow!=null && !"User Tasks".equals(bridge.chainNow)) return bridge.chainNow;
+        return bridge.runningCallId!=null ? "task" : "idle";
+    }
+    /** Whether a Core call that names an item to drop is running: that drop is the owner's own. */
+    public static boolean dropAuthorizedNow() { var bridge=instance; return bridge!=null && bridge.dropAuthorized(); }
+    public static boolean portalAuthorizedNow() { var bridge=instance; return bridge!=null && bridge.portalAuthorized(); }
+    private String runningOp; private boolean runningEnters,runningAuthorizedDrop;
+    /** Core marks a drop it has approved (a give, a drop the owner asked for); any other drop is refused if the item is protected. */
+    private boolean dropAuthorized() { return runningCallId!=null && runningAuthorizedDrop; }
+    private boolean portalAuthorized() { return runningCallId!=null && "task.portal".equals(runningOp) && runningEnters; }
+    private void applyPolicySettings(IoPolicy policy) {
+        var areas=new java.util.ArrayList<adris.altoclef.util.BlockRange>();
+        for (var r:policy.regions()) {
+            var start=new BlockPos(r.minX(),r.minY(),r.minZ()); var end=new BlockPos(r.maxX(),r.maxY(),r.maxZ());
+            for (var dimension:adris.altoclef.util.Dimension.values()) {
+                String key="minecraft:"+(dimension==adris.altoclef.util.Dimension.OVERWORLD ? "overworld" : dimension==adris.altoclef.util.Dimension.NETHER ? "the_nether" : "the_end");
+                if (r.dimension()==null || r.dimension().equals(key)) areas.add(new adris.altoclef.util.BlockRange(start,end,dimension));
+            }
+        }
+        mod.getModSettings().setAreasToProtect(areas);
+        log("policy "+policy.version+" installed: "+policy.regions().size()+" protected regions");
+    }
+    private final Map<String,Long> blockedAt=new HashMap<>();
+    private void reportBlocked(String boundary,String reason,String detail) {
+        String key=boundary+"|"+reason+"|"+detail; long now=System.currentTimeMillis();
+        Long last=blockedAt.get(key);
+        if (last!=null && now-last<2000) return;
+        blockedAt.put(key,now);
+        if (blockedAt.size()>256) blockedAt.clear();
+        var event=json.createObjectNode().put("kind","policy_blocked").put("at",Instant.now().toString());
+        var d=event.putObject("detail");
+        d.put("boundary",boundary).put("reason",reason).put("detail",detail).put("source",actingSource());
+        if (runningCallId!=null) d.put("callId",runningCallId);
+        send("body.event",event);
+    }
+
     public static void start(AltoClef mod) {
         String token = System.getenv("IO_BRIDGE_TOKEN");
         if (token == null || token.isBlank()) return;
         String url = System.getenv().getOrDefault("IO_BRIDGE_URL", "ws://127.0.0.1:8766");
-        new IoBridge(mod, url, token).begin();
+        instance = new IoBridge(mod, url, token);
+        instance.begin();
     }
 
     private IoBridge(AltoClef mod, String url, String token) {
@@ -124,10 +169,19 @@ public final class IoBridge {
                     WebSocket ws = client.newWebSocketBuilder().buildAsync(URI.create(url), new Listener()).get();
                     seq = 0;
                     socket = ws;
+                    lastCoreMessageAt = System.currentTimeMillis();
                     sendHello();
                 } catch (Exception e) {
                     socket = null;
                 }
+            }
+            // Core pings every second. A link that has been quiet this long is dead, whether or not the socket
+            // says so: drop it, so the loop above opens a new one. (A socket that failed a send used to stay
+            // "connected" for ever, and the body sat without a Core.)
+            WebSocket live = socket;
+            if (live != null && welcomed && System.currentTimeMillis() - lastCoreMessageAt > CORE_SILENCE_MS) {
+                try { live.abort(); } catch (Exception ignored) { }
+                if (socket == live) linkDown("no word from Core for " + CORE_SILENCE_MS / 1000 + "s");
             }
             try {
                 Thread.sleep(2000);
@@ -136,6 +190,9 @@ public final class IoBridge {
             }
         }
     }
+
+    private static final long CORE_SILENCE_MS = 10_000;
+    private volatile long lastCoreMessageAt = System.currentTimeMillis();
 
     private final class Listener implements WebSocket.Listener {
         @Override
@@ -225,16 +282,29 @@ public final class IoBridge {
             payload.put("bodySession", bodySession);
             payload.put("seq", seq++);
             try {
-                ws.sendText(json.writeValueAsString(envelope(type, payload)), true);
+                String text = json.writeValueAsString(envelope(type, payload));
+                // A java.net.http.WebSocket takes one send at a time: a second sendText while the first is still
+                // being written does not throw, it hands back a future that has failed, and the message is gone.
+                // A burst of replies (a snapshot is a hundred queries) lost most of them that way, and Core
+                // waited for ever for answers that were never sent. Each send now waits for the one before it.
+                sendTail = sendTail.handle((r, e) -> null).thenCompose(ignored -> ws.sendText(text, true))
+                        .whenComplete((r, e) -> {
+                            if (e == null) return;
+                            log("send failed (" + type + "): " + e);
+                            // The output is closed: this socket is finished, so reconnect rather than keep it.
+                            if (socket == ws) linkDown("send failed: " + e);
+                        });
             } catch (Exception e) {
                 log("send failed: " + e);
             }
         }
     }
+    private java.util.concurrent.CompletableFuture<?> sendTail = java.util.concurrent.CompletableFuture.completedFuture(null);
 
     // ---- receiving --------------------------------------------------------------------------
 
     private void onMessage(String text) throws Exception {
+        lastCoreMessageAt = System.currentTimeMillis();
         JsonNode env = json.readTree(text);
         String type = env.path("type").asText();
         JsonNode p = env.path("payload");
@@ -242,6 +312,7 @@ public final class IoBridge {
             case "core.welcome" -> {
                 coreSession = p.path("coreSession").asText();
                 welcomed = true;
+                IoPolicy.clear(); // until Core pushes its policy, nothing but survival chains runs
                 log("welcomed by Core session " + coreSession);
                 // A new Core connection needs a snapshot even if the player has not moved.
                 MinecraftClient.getInstance().execute(() -> pushState(true));
@@ -250,6 +321,13 @@ public final class IoBridge {
                 ObjectNode pong = json.createObjectNode();
                 pong.put("at", Instant.now().toString());
                 send("pong", pong);
+            }
+            case "core.policy" -> {
+                var policy=new IoPolicy(p.path("policy"));
+                IoPolicy.install(policy);
+                MinecraftClient.getInstance().execute(() -> applyPolicySettings(policy));
+                ObjectNode ack=json.createObjectNode(); ack.put("version",policy.version);
+                send("body.policyAck",ack);
             }
             case "body.call" -> MinecraftClient.getInstance().execute(() -> onCall(p));
             case "body.cancel" -> MinecraftClient.getInstance().execute(() -> onCancel(p.path("callId").asText()));
@@ -264,6 +342,8 @@ public final class IoBridge {
         String op = p.path("op").asText();
         JsonNode args = p.path("args");
 
+        // Until Core's policy is held, nothing but survival chains runs (6.7).
+        if (IoPolicy.current()==null) { result(callId,"failed","policy_pending",null); return; }
         // A callId already seen is never run again: say what it came to (6.2).
         JsonNode known = finished.get(callId);
         if (known != null) {
@@ -282,6 +362,7 @@ public final class IoBridge {
             return;
         }
 
+        if (!"prim.chat".equals(op)) { runningOp = op; runningEnters = args.path("enter").asBoolean(false); runningAuthorizedDrop = args.path("authorizedDrop").asBoolean(false); }
         // Chat must remain usable while a task owns the body (progress, stop, approvals).
         if ("prim.chat".equals(op)) {
             String text = args.path("text").asText();
@@ -381,6 +462,7 @@ public final class IoBridge {
             if (loaded) {
                 var state=mod.getWorld().getBlockState(pos);
                 value.put("name", Registries.BLOCK.getId(state.getBlock()).getPath());
+                var biome=mod.getWorld().getBiome(pos).getKey(); if (biome.isPresent()) value.put("biome",biome.get().getValue().getPath());
                 ObjectNode properties=value.putObject("properties");
                 state.getEntries().forEach((property,setting)->properties.put(property.getName(),setting instanceof net.minecraft.util.StringIdentifiable named ? named.asString() : setting.toString()));
             }
@@ -440,6 +522,69 @@ public final class IoBridge {
                 ObjectNode row = found.addObject().put("name", Registries.BLOCK.getId(mod.getWorld().getBlockState(pos).getBlock()).getPath());
                 row.putObject("pos").put("x",pos.getX()).put("y",pos.getY()).put("z",pos.getZ());
             });
+        } else if ("query.players".equals(op)) {
+            // Everyone on the server, in sight or not: what an entity list cannot say.
+            ArrayNode rows=value.putArray("players");
+            var handler=MinecraftClient.getInstance().getNetworkHandler();
+            if (handler!=null) for (var entry:handler.getPlayerList())
+                rows.addObject().put("username",entry.getProfile().getName()).put("uuid",entry.getProfile().getId().toString());
+        } else if ("query.census".equals(op)) {
+            // How many of each block lie within `radius` of the body, in the chunks the client holds: what a plan
+            // may ask ("how many X are near", "is any X in view") without a query for each.
+            int radius=args.path("radius").asInt(24);
+            if (radius<1 || radius>64) throw new IllegalArgumentException("invalid census radius");
+            var center=args.has("near") ? readPosition(args.path("near")) : mod.getPlayer().getBlockPos();
+            var counts=new java.util.HashMap<String,Integer>();
+            var loadedChunks=new java.util.HashMap<Long,Boolean>();
+            for (BlockPos pos : BlockPos.iterate(center.add(-radius,-radius,-radius), center.add(radius,radius,radius))) {
+                if (pos.getSquaredDistance(center) > radius*radius) continue;
+                long chunk=net.minecraft.util.math.ChunkPos.toLong(pos.getX()>>4,pos.getZ()>>4);
+                if (!loadedChunks.computeIfAbsent(chunk,key->isLoaded(pos))) continue;
+                var block=mod.getWorld().getBlockState(pos).getBlock();
+                if (block==net.minecraft.block.Blocks.AIR || block==net.minecraft.block.Blocks.CAVE_AIR || block==net.minecraft.block.Blocks.VOID_AIR) continue;
+                counts.merge(Registries.BLOCK.getId(block).getPath(),1,Integer::sum);
+            }
+            ObjectNode rows=value.putObject("counts");
+            counts.forEach(rows::put);
+        } else if ("query.lookedAt".equals(op)) {
+            // The block a player is looking at: a ray from their eyes along where they face, as the client sees the world.
+            UUID who=UUID.fromString(args.path("uuid").asText());
+            double range=args.path("range").asDouble(6);
+            if (!Double.isFinite(range) || range<=0 || range>32) throw new IllegalArgumentException("invalid look range");
+            net.minecraft.entity.Entity target=null;
+            for (var entity:mod.getWorld().getEntities()) if (entity.getUuid().equals(who)) target=entity;
+            if (target==null) { value.putNull("block"); }
+            else {
+                // A player's head turns apart from the body: where they look is the head's yaw.
+                var eyes=target.getEyePos();
+                var facing=target instanceof net.minecraft.entity.LivingEntity living3 ? target.getRotationVector(target.getPitch(),living3.getHeadYaw()) : target.getRotationVec(1.0f);
+                var end=eyes.add(facing.multiply(range));
+                var hit=mod.getWorld().raycast(new net.minecraft.world.RaycastContext(eyes,end,net.minecraft.world.RaycastContext.ShapeType.OUTLINE,net.minecraft.world.RaycastContext.FluidHandling.NONE,target));
+                if (hit.getType()!=net.minecraft.util.hit.HitResult.Type.BLOCK) value.putNull("block");
+                else {
+                    var at=hit.getBlockPos();
+                    ObjectNode block=value.putObject("block");
+                    block.put("name",Registries.BLOCK.getId(mod.getWorld().getBlockState(at).getBlock()).getPath());
+                    block.putObject("pos").put("x",at.getX()).put("y",at.getY()).put("z",at.getZ());
+                }
+            }
+        } else if ("query.policy".equals(op)) {
+            var policy=IoPolicy.current();
+            value.put("version",policy==null ? -1 : policy.version);
+            if (args.has("playerMade")) {
+                ObjectNode rows=value.putObject("playerMade");
+                for (JsonNode block:args.path("playerMade")) rows.put(block.asText(),IoPolicy.isPlayerMade(block.asText()));
+            }
+        } else if ("query.inventory".equals(op)) {
+            var player=mod.getPlayer(); int free=0; double best=-1;
+            for (int i=0;i<36;i++) {
+                var stack=player.getInventory().getStack(i);
+                if (stack.isEmpty()) { free++; continue; }
+                if (Registries.ITEM.getId(stack.getItem()).getPath().endsWith("_pickaxe") && stack.getMaxDamage()>0)
+                    best=Math.max(best,1.0-(double)stack.getDamage()/stack.getMaxDamage());
+            }
+            value.put("freeSlots",free);
+            if (best<0) value.putNull("pickaxeLeft"); else value.put("pickaxeLeft",best);
         } else if ("query.light".equals(op)) {
             value.put("timeOfDay",Math.floorMod(mod.getWorld().getTimeOfDay(),24000));
             value.put("thundering",mod.getWorld().isThundering());
@@ -463,6 +608,17 @@ public final class IoBridge {
                 entry.put("uuid",entity.getUuid().toString()); entry.put("alive",entity.isAlive());
                 entry.put("living",entity instanceof net.minecraft.entity.LivingEntity);
                 if (entity instanceof net.minecraft.entity.LivingEntity living) entry.put("health",living.getHealth());
+                if (entity instanceof net.minecraft.entity.LivingEntity living && args.has("hunt")) {
+                    String refusal=huntRefusal(living,args.path("hunt"));
+                    entry.put("huntEligible",refusal==null);
+                    if (refusal==null) entry.putNull("huntReason"); else entry.put("huntReason",refusal);
+                }
+                if (entity instanceof net.minecraft.entity.LivingEntity living2) entry.put("sleeping",living2.isSleeping());
+                if (entity instanceof net.minecraft.entity.ItemEntity dropped) {
+                    entry.put("item",Registries.ITEM.getId(dropped.getStack().getItem()).getPath());
+                    entry.put("count",dropped.getStack().getCount());
+                    entry.put("own",ownDrops.contains(dropped.getId()));
+                }
                 entry.put("hostile",entity instanceof net.minecraft.entity.mob.HostileEntity || entity instanceof net.minecraft.entity.mob.SlimeEntity || entity instanceof net.minecraft.entity.mob.PhantomEntity);
                 if (entity instanceof net.minecraft.entity.passive.SheepEntity sheep) entry.put("sheared",sheep.isSheared());
                 if (entity instanceof net.minecraft.entity.player.PlayerEntity player) {
@@ -537,6 +693,63 @@ public final class IoBridge {
         return value;
     }
 
+    private net.minecraft.util.math.Vec3d readHuntVector(JsonNode pos) {
+        for (String axis:new String[]{"x","y","z"}) if (!pos.path(axis).isNumber() || !Double.isFinite(pos.path(axis).asDouble())) throw new IllegalArgumentException("finite position required");
+        return new net.minecraft.util.math.Vec3d(pos.path("x").asDouble(),pos.path("y").asDouble(),pos.path("z").asDouble());
+    }
+    private String huntProtection(net.minecraft.entity.LivingEntity animal,JsonNode guard) {
+        String kind=Registries.ENTITY_TYPE.getId(animal.getType()).getPath();
+        if (!java.util.Set.of("cow","pig","sheep","chicken","rabbit").contains(kind)) return "not_wild_food_animal";
+        if (animal.hasCustomName()) return "named";
+        if (animal.isBaby()) return "baby";
+        if (animal instanceof net.minecraft.entity.mob.MobEntity mob && mob.isLeashed()) return "leashed";
+        if (guard.has("places")) {
+            if (!guard.path("places").isArray() || guard.path("places").size()>128) throw new IllegalArgumentException("invalid protected places");
+            for (var place:guard.path("places")) {
+                double radius=place.path("radius").asDouble(-1);
+                if (!Double.isFinite(radius) || radius<0 || radius>2000) throw new IllegalArgumentException("invalid place radius");
+                if (animal.squaredDistanceTo(readHuntVector(place.path("position")))<=radius*radius) return "named_place";
+            }
+        }
+        var centre=animal.getBlockPos();
+        // Match the existing conservative nearby-fence protection, including large pens.
+        for (var p:BlockPos.iterate(centre.add(-32,-32,-32),centre.add(32,32,32))) {
+            if (p.getSquaredDistance(centre)>1024 || !isLoaded(p)) continue;
+            var block=mod.getWorld().getBlockState(p).getBlock();
+            if (block instanceof net.minecraft.block.FenceBlock || block instanceof net.minecraft.block.FenceGateBlock || block instanceof net.minecraft.block.WallBlock) return "penned";
+        }
+        var queue=new java.util.ArrayList<BlockPos>(); queue.add(centre);
+        var visited=new java.util.HashSet<BlockPos>();
+        for (int i=0;i<queue.size() && visited.size()<200;i++) {
+            var p=queue.get(i); if (!visited.add(p)) continue;
+            for (var direction:net.minecraft.util.math.Direction.Type.HORIZONTAL) {
+                var next=p.offset(direction);
+                if (!isLoaded(next) || !isLoaded(next.down(2)) || !isLoaded(next.up(2))) return "penned";
+                var here=mod.getWorld().getBlockState(next); var below=mod.getWorld().getBlockState(next.down());
+                var head=mod.getWorld().getBlockState(next.up());
+                boolean solid=here.isSolidBlock(mod.getWorld(),next), foot=below.isSolidBlock(mod.getWorld(),next.down());
+                if (!solid && !head.isSolidBlock(mod.getWorld(),next.up()) && foot) queue.add(next);
+                else if (solid && !head.isSolidBlock(mod.getWorld(),next.up()) && !mod.getWorld().getBlockState(next.up(2)).isSolidBlock(mod.getWorld(),next.up(2))) queue.add(next.up());
+                else if (!solid && !head.isSolidBlock(mod.getWorld(),next.up()) && !foot && mod.getWorld().getBlockState(next.down(2)).isSolidBlock(mod.getWorld(),next.down(2))) queue.add(next.down());
+            }
+        }
+        return null;
+    }
+    private String huntRefusal(net.minecraft.entity.LivingEntity animal,JsonNode guard) {
+        var origin=readHuntVector(guard.path("origin"));
+        double radius=guard.path("radius").asDouble(-1);
+        if (!Double.isFinite(radius) || radius<1 || radius>32) throw new IllegalArgumentException("invalid hunt radius");
+        if (animal.squaredDistanceTo(origin)>radius*radius) return "target_escaped";
+        String reason=huntProtection(animal,guard); if (reason!=null) return reason;
+        int adults=0;
+        for (var entity:mod.getWorld().getEntities()) {
+            if (entity instanceof net.minecraft.entity.LivingEntity living && living.getHealth()>0 && living.isAlive()
+                && living.getType()==animal.getType() && living.squaredDistanceTo(origin)<=1024
+                && huntProtection(living,guard)==null) adults++;
+        }
+        return adults>2 ? null : "leave_two";
+    }
+
     private void startAttack(String callId,JsonNode args) {
         int id=args.path("entityId").asInt(-1); UUID uuid=UUID.fromString(args.path("entityUuid").asText());
         double threshold=args.path("retreatBelowHealth").asDouble(6);
@@ -552,19 +765,22 @@ public final class IoBridge {
             else continue;
             if (score>rank) { rank=score; weapon=item; }
         }
+        { String refusal=IoPolicy.current()==null ? null : IoPolicy.current().attackRefusal(living);
+          if (refusal!=null) { reportBlocked("attack",refusal,living.getType().getUntranslatedName()+"#"+living.getId()); result(callId,"failed","policy_blocked",null); return; } }
         if (weapon==null) { result(callId,"failed","no_weapon",null); return; }
-        var task=new IoAttackTask(living,threshold,weapon);
+        var task=new IoAttackTask(living,threshold,weapon,args.has("hunt") ? args.path("hunt") : null);
         beginTask(callId,task,()->result(callId,task.failure==null ? "ok" : "failed",task.failure,task.value()),task::value);
     }
     private final class IoAttackTask extends Task implements ITaskRequiresGrounded {
         private final net.minecraft.entity.LivingEntity entity;
         private final double threshold;
         private final Task kill,equip;
+        private final JsonNode hunt;
         private final net.minecraft.item.Item weapon;
         private long started;
         private boolean done,killed,oldBreak,oldPlace;
         private String failure;
-        IoAttackTask(net.minecraft.entity.LivingEntity entity,double threshold,net.minecraft.item.Item weapon) { this.entity=entity; this.threshold=threshold; this.weapon=weapon; equip=new IoEquipTask(weapon,net.minecraft.entity.EquipmentSlot.MAINHAND); kill=new adris.altoclef.tasks.entity.KillEntityTask(entity); }
+        IoAttackTask(net.minecraft.entity.LivingEntity entity,double threshold,net.minecraft.item.Item weapon,JsonNode hunt) { this.hunt=hunt; this.entity=entity; this.threshold=threshold; this.weapon=weapon; equip=new IoEquipTask(weapon,net.minecraft.entity.EquipmentSlot.MAINHAND); kill=new adris.altoclef.tasks.entity.KillEntityTask(entity); }
         ObjectNode value() { return json.createObjectNode().put("entityId",entity.getId()).put("entityUuid",entity.getUuid().toString()).put("killed",killed).put("healthRemaining",mod.getPlayer().getHealth()); }
         @Override protected void onStart() {
             started=System.currentTimeMillis(); mod.getBehaviour().push(); mod.getBehaviour().avoidBlockBreaking(p->true);
@@ -576,6 +792,10 @@ public final class IoBridge {
             if (mod.getPlayer().getHealth()<=threshold) { failure="health_too_low"; done=true; return null; }
             if (mod.getWorld().getEntityById(entity.getId())!=entity || !entity.isAlive()) { failure="target_not_found"; done=true; return null; }
             if (System.currentTimeMillis()-started>170000) { failure="target_unreachable"; done=true; return null; }
+            if (hunt!=null) {
+                String refusal=huntRefusal(entity,hunt);
+                if (refusal!=null) { failure=refusal.equals("target_escaped") ? refusal : "only_protected_animals"; done=true; return null; }
+            }
             if (mod.getPlayer().getMainHandStack().getItem()!=weapon) return equip;
             return kill;
         }
@@ -1304,6 +1524,25 @@ public final class IoBridge {
         beginTask(callId,task,() -> result(callId,task.failure == null ? "ok" : "failed",task.failure,task.value()),task::value);
     }
 
+    /** Walk to an open side before asking AltoClef to click a container. Its generic interaction
+     * goal can try to stand on top of a solid chest and wander without ever opening it. */
+    private Task approachContainer(BlockPos pos) {
+        BlockPos player=mod.getPlayer().getBlockPos();
+        BlockPos best=null;
+        double distance=Double.POSITIVE_INFINITY;
+        for (var side : new net.minecraft.util.math.Direction[]{net.minecraft.util.math.Direction.NORTH,
+                net.minecraft.util.math.Direction.SOUTH,net.minecraft.util.math.Direction.EAST,
+                net.minecraft.util.math.Direction.WEST}) {
+            BlockPos stand=pos.offset(side);
+            if (!isLoaded(stand) || !mod.getWorld().getBlockState(stand).getCollisionShape(mod.getWorld(),stand).isEmpty()
+                    || !mod.getWorld().getBlockState(stand.up()).getCollisionShape(mod.getWorld(),stand.up()).isEmpty()
+                    || mod.getWorld().getBlockState(stand.down()).getCollisionShape(mod.getWorld(),stand.down()).isEmpty()) continue;
+            double here=stand.getSquaredDistance(player);
+            if (here<distance) { best=stand; distance=here; }
+        }
+        return best==null ? null : new GetToBlockTask(best,false);
+    }
+
     /** Move held stacks without gathering, discarding, or leaving a partial stack on the cursor. */
     private final class IoContainerTransferTask extends Task implements ITaskRequiresGrounded {
         private final BlockPos pos;
@@ -1312,6 +1551,7 @@ public final class IoBridge {
         private final int requested;
         private final boolean deposit;
         private final Task interact;
+        private final Task approach;
         private net.minecraft.screen.ScreenHandler handler;
         private int storageSlots, beforeSource, beforeDestination, wanted, moved, sourceSlot=-1;
         private long lastClick;
@@ -1322,6 +1562,7 @@ public final class IoBridge {
             this.pos=pos; this.name=name; this.item=item; this.itemName=itemName;
             this.requested=requested; this.deposit=deposit;
             interact=new adris.altoclef.tasks.InteractWithBlockTask(pos);
+            approach=approachContainer(pos);
         }
         private int count(boolean source) {
             int total=0;
@@ -1387,6 +1628,7 @@ public final class IoBridge {
                 failure="not_a_container"; done=true; return null;
             }
             if (handler==null) {
+                if (approach!=null && mod.getPlayer().getBlockPos().getSquaredDistance(pos)>4) return approach;
                 if (containerSnapshot(pos)==null) return interact;
                 handler=mod.getPlayer().currentScreenHandler; storageSlots=handler.slots.size()-36;
                 beforeSource=count(true); beforeDestination=count(false); wanted=Math.min(requested,beforeSource);
@@ -1449,11 +1691,13 @@ public final class IoBridge {
         private final String name;
         private final boolean furnace;
         private final Task interact;
+        private final Task approach;
         private String failure;
         private ObjectNode observed;
         IoObserveContainerTask(BlockPos pos, String name, boolean furnace) {
             this.pos=pos; this.name=name; this.furnace=furnace;
             interact=new adris.altoclef.tasks.InteractWithBlockTask(pos);
+            approach=approachContainer(pos);
         }
         @Override protected void onStart() { StorageHelper.closeScreen(); syncedInventoryHandler=null; }
         @Override protected Task onTick() {
@@ -1463,6 +1707,7 @@ public final class IoBridge {
             }
             observed=screenSnapshot(pos,furnace);
             if (observed != null) return null;
+            if (approach!=null && mod.getPlayer().getBlockPos().getSquaredDistance(pos)>4) return approach;
             return interact;
         }
         @Override public boolean isFinished() { return failure != null || observed != null; }
@@ -1478,6 +1723,16 @@ public final class IoBridge {
         if (!Registries.BLOCK.containsId(id) || !(Registries.ITEM.get(id) instanceof net.minecraft.item.BlockItem)) {
             result(callId, "failed", "unknown_block", null); return;
         }
+        if (name.equals("ladder")) {
+            var task = new IoLadderPlaceTask(pos);
+            beginTask(callId, task, () -> result(callId, task.failure == null ? "ok" : "failed", task.failure, task.value()), task::value);
+            return;
+        }
+        if (name.endsWith("_door")) {
+            var task = new IoDoorPlaceTask(pos, Registries.BLOCK.get(id), name);
+            beginTask(callId, task, () -> result(callId, task.failure == null ? "ok" : "failed", task.failure, task.value()), task::value);
+            return;
+        }
         if (args.path("stationary").asBoolean(false)) {
             var task=new IoStationaryPlaceTask(pos,Registries.BLOCK.get(id),name);
             beginTask(callId,task,()->result(callId,task.failure==null ? "ok" : "failed",task.failure,task.value()),task::value);
@@ -1490,6 +1745,161 @@ public final class IoBridge {
             return value;
         };
         beginTask(callId, task, () -> result(callId, task.failure == null ? "ok" : "failed", task.failure, observed.get()), observed);
+    }
+
+    /**
+     * Hang a ladder on the side of a solid block beside the spot. The builder's own block placer puts cobblestone
+     * where it cannot place the block it was asked for, which for a ladder fills the very cell it is meant to climb.
+     * Stands in the free cell opposite the wall, which is where a person stands to put one up.
+     */
+    private final class IoLadderPlaceTask extends Task {
+        private final BlockPos pos;
+        private long started, clicked;
+        private int attempts;
+        private boolean done;
+        private String failure;
+        IoLadderPlaceTask(BlockPos pos) { this.pos = pos; }
+        ObjectNode value() {
+            var value = json.createObjectNode().put("block", "ladder");
+            value.putObject("pos").put("x", pos.getX()).put("y", pos.getY()).put("z", pos.getZ());
+            return value;
+        }
+        @Override protected void onStart() {
+            started = System.currentTimeMillis();
+            mod.getBehaviour().push();
+            mod.getBehaviour().addProtectedItems(net.minecraft.item.Items.LADDER);
+        }
+        @Override protected Task onTick() {
+            if (!isLoaded(pos)) { failure = "place_failed"; done = true; return null; }
+            var state = mod.getWorld().getBlockState(pos);
+            if (state.isOf(net.minecraft.block.Blocks.LADDER)) { done = true; return null; }
+            if (!state.isReplaceable() || !state.getFluidState().isEmpty()) { failure = "position_occupied"; done = true; return null; }
+            if (countOf("ladder") < 1) { failure = "not_in_inventory"; done = true; return null; }
+            long now = System.currentTimeMillis();
+            if (now - started > 40000 || attempts >= 4) { failure = "place_failed"; done = true; return null; }
+            net.minecraft.util.math.Direction wall = null;
+            for (var direction : new net.minecraft.util.math.Direction[] {
+                    net.minecraft.util.math.Direction.NORTH, net.minecraft.util.math.Direction.SOUTH,
+                    net.minecraft.util.math.Direction.EAST, net.minecraft.util.math.Direction.WEST }) {
+                var side = pos.offset(direction);
+                if (isLoaded(side) && mod.getWorld().getBlockState(side).isSideSolidFullSquare(mod.getWorld(), side, direction.getOpposite())) { wall = direction; break; }
+            }
+            if (wall == null) { failure = "nothing_to_place_against"; done = true; return null; }
+            var support = pos.offset(wall);
+            var face = wall.getOpposite();
+            var hit = net.minecraft.util.math.Vec3d.ofCenter(support).add(face.getOffsetX() * 0.5, face.getOffsetY() * 0.5, face.getOffsetZ() * 0.5);
+            if (mod.getPlayer().getEyePos().squaredDistanceTo(hit) > 16.0) {
+                var stand = pos.offset(face);
+                if (!isLoaded(stand) || !mod.getWorld().getBlockState(stand).isReplaceable()) { failure = "spot_unreachable"; done = true; return null; }
+                return new adris.altoclef.tasks.movement.GetToBlockTask(stand, false);
+            }
+            if (clicked != 0 && now - clicked < 600) return null;
+            if (!mod.getSlotHandler().forceEquipItem(new net.minecraft.item.Item[] { net.minecraft.item.Items.LADDER }, true)) return null;
+            adris.altoclef.util.helpers.LookHelper.lookAt(mod, hit, false);
+            mod.getController().interactBlock(mod.getPlayer(), net.minecraft.util.Hand.MAIN_HAND, new net.minecraft.util.hit.BlockHitResult(hit, face, support, false));
+            clicked = now; attempts++;
+            return null;
+        }
+        @Override public boolean isFinished() { return done; }
+        @Override protected void onStop(Task interrupt) { mod.getBehaviour().pop(); }
+        @Override protected boolean isEqual(Task other) { return this == other; }
+        @Override protected String toDebugString() { return "IO ladder " + pos; }
+    }
+
+    /** A door is two blocks high. The generic one-block schematic builder can wander indefinitely at a doorway. */
+    private final class IoDoorPlaceTask extends Task implements ITaskRequiresGrounded {
+        private final BlockPos pos;
+        private final net.minecraft.block.Block block;
+        private final String name;
+        private Task movement;
+        private BlockPos stand;
+        private final java.util.Set<BlockPos> triedStands = new java.util.HashSet<>();
+        private long started, movingSince, clicked;
+        private int attempts;
+        private int oldFall;
+        private boolean fallRaised;
+        private boolean done;
+        private String failure;
+        IoDoorPlaceTask(BlockPos pos, net.minecraft.block.Block block, String name) {
+            this.pos = pos; this.block = block; this.name = name;
+        }
+        ObjectNode value() {
+            var value = json.createObjectNode().put("block", name);
+            value.putObject("pos").put("x", pos.getX()).put("y", pos.getY()).put("z", pos.getZ());
+            return value;
+        }
+        @Override protected void onStart() {
+            started = System.currentTimeMillis();
+            mod.getBehaviour().push();
+            mod.getBehaviour().addProtectedItems(block.asItem());
+            var settings = mod.getClientBaritoneSettings();
+            oldFall = settings.maxFallHeightNoWater.value;
+            if (mod.getPlayer().getHealth() >= 10 && oldFall < 5) {
+                settings.maxFallHeightNoWater.value = 5;
+                fallRaised = true;
+            }
+        }
+        private boolean openStand(BlockPos at) {
+            return isLoaded(at) && isLoaded(at.up()) && isLoaded(at.down())
+                && mod.getWorld().getBlockState(at).isReplaceable()
+                && mod.getWorld().getBlockState(at.up()).isReplaceable()
+                && mod.getWorld().getFluidState(at).isEmpty()
+                && mod.getWorld().getBlockState(at.down()).isSideSolidFullSquare(mod.getWorld(), at.down(), net.minecraft.util.math.Direction.UP);
+        }
+        @Override protected Task onTick() {
+            if (!isLoaded(pos) || !isLoaded(pos.up()) || !isLoaded(pos.down())) {
+                failure = "place_failed"; done = true; return null;
+            }
+            if (mod.getWorld().getBlockState(pos).isOf(block)) { done = true; return null; }
+            if (!mod.getWorld().getBlockState(pos).isReplaceable()
+                || !mod.getWorld().getBlockState(pos.up()).isReplaceable()
+                || !mod.getWorld().getFluidState(pos).isEmpty()) {
+                failure = "position_occupied"; done = true; return null;
+            }
+            if (!mod.getWorld().getBlockState(pos.down()).isSideSolidFullSquare(mod.getWorld(), pos.down(), net.minecraft.util.math.Direction.UP)) {
+                failure = "nothing_to_place_against"; done = true; return null;
+            }
+            if (countOf(name) < 1) { failure = "not_in_inventory"; done = true; return null; }
+            long now = System.currentTimeMillis();
+            if (now - started > 40000 || attempts >= 4) { failure = "place_failed"; done = true; return null; }
+            var hit = net.minecraft.util.math.Vec3d.ofCenter(pos.down()).add(0, 0.5, 0);
+            if (mod.getPlayer().getEyePos().squaredDistanceTo(hit) > 20.25) {
+                if (stand == null || !openStand(stand) || now - movingSince > 12000) {
+                    if (stand != null) triedStands.add(stand);
+                    stand = null;
+                    for (var direction : new net.minecraft.util.math.Direction[] {
+                            net.minecraft.util.math.Direction.NORTH, net.minecraft.util.math.Direction.SOUTH,
+                            net.minecraft.util.math.Direction.EAST, net.minecraft.util.math.Direction.WEST }) {
+                        var candidate = pos.offset(direction);
+                        if (!triedStands.contains(candidate) && openStand(candidate)
+                            && (stand == null || candidate.getSquaredDistance(mod.getPlayer().getBlockPos()) < stand.getSquaredDistance(mod.getPlayer().getBlockPos())))
+                            stand = candidate;
+                    }
+                    if (stand == null) { failure = "spot_unreachable"; done = true; return null; }
+                    movement = new GetToBlockTask(stand, false);
+                    movingSince = now;
+                }
+                return movement;
+            }
+            if (mod.getPlayer().getBoundingBox().intersects(new net.minecraft.util.math.Box(pos))) {
+                failure = "position_occupied"; done = true; return null;
+            }
+            if (clicked != 0 && now - clicked < 600) return null;
+            if (!mod.getSlotHandler().forceEquipItem(new net.minecraft.item.Item[] { block.asItem() }, true)) return null;
+            adris.altoclef.util.helpers.LookHelper.lookAt(mod, hit, false);
+            mod.getController().interactBlock(mod.getPlayer(), net.minecraft.util.Hand.MAIN_HAND,
+                new net.minecraft.util.hit.BlockHitResult(hit, net.minecraft.util.math.Direction.UP, pos.down(), false));
+            clicked = now; attempts++;
+            return null;
+        }
+        @Override public boolean isFinished() { return done; }
+        @Override protected void onStop(Task interrupt) {
+            mod.getClientBaritone().getPathingBehavior().forceCancel();
+            if (fallRaised) mod.getClientBaritoneSettings().maxFallHeightNoWater.value = oldFall;
+            mod.getBehaviour().pop();
+        }
+        @Override protected boolean isEqual(Task other) { return this == other; }
+        @Override protected String toDebugString() { return "IO door place " + pos; }
     }
 
     /** Place a nearby supported block without asking the builder to climb out of an enclosure. */
@@ -1553,12 +1963,26 @@ public final class IoBridge {
             this.pos = pos; this.block = block; this.name = name;
             place = new adris.altoclef.tasks.construction.PlaceBlockTask(pos, block);
         }
-        @Override protected void onStart() { }
+        private int oldFall;
+        private boolean fallRaised;
+        private long movedAt;
+        private net.minecraft.util.math.Vec3d lastPlayer;
+        @Override protected void onStart() {
+            // A builder standing on the roof it just laid is boxed in by the default 3-block fall limit.
+            // One heart of fall damage is cheaper than being stuck, but only while health allows it.
+            var settings = mod.getClientBaritoneSettings();
+            oldFall = settings.maxFallHeightNoWater.value;
+            if (mod.getPlayer().getHealth() >= 10 && oldFall < 5) { settings.maxFallHeightNoWater.value = 5; fallRaised = true; }
+            movedAt = System.currentTimeMillis(); lastPlayer = mod.getPlayer().getPos();
+        }
         @Override protected Task onTick() {
             if (!isLoaded(pos)) { failure = "place_failed"; return null; }
             var state = mod.getWorld().getBlockState(pos);
             if (!state.isReplaceable() || !state.getFluidState().isEmpty()) { failure = "position_occupied"; return null; }
             if (countOf(name) < 1) { failure = "not_in_inventory"; return null; }
+            long now = System.currentTimeMillis();
+            if (mod.getPlayer().getPos().distanceTo(lastPlayer) > 0.4) { lastPlayer = mod.getPlayer().getPos(); movedAt = now; }
+            else if (now - movedAt > 25000) { failure = "place_failed"; return null; }
             boolean support = false;
             for (var direction : net.minecraft.util.math.Direction.values()) {
                 var at = pos.offset(direction);
@@ -1570,7 +1994,9 @@ public final class IoBridge {
         @Override public boolean isFinished() {
             return failure != null || (isLoaded(pos) && mod.getWorld().getBlockState(pos).getBlock() == block);
         }
-        @Override protected void onStop(Task interrupt) { }
+        @Override protected void onStop(Task interrupt) {
+            if (fallRaised) mod.getClientBaritoneSettings().maxFallHeightNoWater.value = oldFall;
+        }
         @Override protected boolean isEqual(Task other) { return this == other; }
         @Override protected String toDebugString() { return "IO place " + pos; }
     }
@@ -1606,6 +2032,11 @@ public final class IoBridge {
         BlockPos pos = readPosition(args.path("pos"));
         String expected = args.path("expectedBlock").asText();
         if (!expected.matches("[a-z0-9_]{1,128}")) throw new IllegalArgumentException("invalid expected block");
+        {
+            var policy=IoPolicy.current();
+            String refusal=policy==null || !isLoaded(pos) ? null : policy.breakRefusal(pos,mod.getWorld().getBlockState(pos).getBlock(),mod.getWorld().getRegistryKey().getValue().toString());
+            if (refusal!=null) { reportBlocked("break",refusal,pos.getX()+","+pos.getY()+","+pos.getZ()); result(callId,"failed","policy_blocked",null); return; }
+        }
         var task = new IoDigTask(pos, expected, args.path("collect").asBoolean(true), args.path("allowLiquid").asBoolean(false), args.path("ripeOnly").asBoolean(false), args.path("allowUp").asBoolean(false), args.path("preserveSurroundings").asBoolean(false));
         PartialSupplier observed = () -> {
             ObjectNode value = json.createObjectNode().put("block", expected);
@@ -1631,16 +2062,40 @@ public final class IoBridge {
         private boolean gone() {
             return isLoaded(pos) && (mod.getWorld().getBlockState(pos).isAir() || !mod.getWorld().getFluidState(pos).isEmpty());
         }
+        /** Whether the inventory has room for this stack: an empty slot, or the same item with space left. */
+        private boolean canTake(ItemStack stack) {
+            var inventory = mod.getPlayer().getInventory();
+            for (int i = 0; i < 36; i++) {
+                var held = inventory.getStack(i);
+                if (held.isEmpty()) return true;
+                if (ItemStack.areItemsAndComponentsEqual(held, stack) && held.getCount() < held.getMaxCount()) return true;
+            }
+            return false;
+        }
+        /** The drop beside the block that IO could actually pick up. With every slot taken a drop stays on the ground, and waiting for it cost eight seconds a block. */
         private java.util.Optional<net.minecraft.entity.ItemEntity> nearbyDrop() {
             return mod.getEntityTracker().getDroppedItems().stream()
-                    .filter(entity -> entity.isAlive() && entity.squaredDistanceTo(net.minecraft.util.math.Vec3d.ofCenter(pos)) <= 16)
+                    .filter(entity -> entity.isAlive() && canTake(entity.getStack())
+                            && entity.squaredDistanceTo(net.minecraft.util.math.Vec3d.ofCenter(pos)) <= 16)
                     .min(java.util.Comparator.comparingDouble(entity -> entity.squaredDistanceTo(mod.getPlayer())));
         }
         @Override protected void onStart() {
-            if (preserveSurroundings) { mod.getBehaviour().push(); mod.getBehaviour().avoidBlockBreaking(p->!p.equals(pos)); }
+            // Nothing but the target is broken on the way to it, except leaves: a log high in a tree is wrapped in them,
+            // and with every other block off limits the path to it did not exist (the top of a tree was "unreachable").
+            if (preserveSurroundings) {
+                mod.getBehaviour().push();
+                mod.getBehaviour().avoidBlockBreaking(p -> !p.equals(pos)
+                        && !(isLoaded(p) && mod.getWorld().getBlockState(p).isIn(net.minecraft.registry.tag.BlockTags.LEAVES)));
+            }
         }
         @Override protected Task onTick() {
             failure = digRefusal(pos, expected, allowLiquid, allowUp);
+            // The policy can come to apply after the call began (the block's update arrives late): stop at once,
+            // rather than let the hook cancel every swing while the task blacklists and retries without end.
+            if (failure == null && IoPolicy.current() != null && isLoaded(pos)) {
+                String refusal = IoPolicy.current().breakRefusal(pos, mod.getWorld().getBlockState(pos).getBlock(), mod.getWorld().getRegistryKey().getValue().toString());
+                if (refusal != null) { reportBlocked("break", refusal, pos.getX() + "," + pos.getY() + "," + pos.getZ()); failure = "policy_blocked"; }
+            }
             if (failure == null && ripeOnly && !gone()) {
                 var state = mod.getWorld().getBlockState(pos);
                 if (!(state.getBlock() instanceof net.minecraft.block.CropBlock crop) || !crop.isMature(state)) failure = "nothing_ripe";
@@ -1820,8 +2275,7 @@ public final class IoBridge {
         boolean hasY = args.has("y");
         int y = args.path("y").asInt();
         if (args.path("walkingOnly").asBoolean(false)) {
-            if (!hasY) throw new IllegalArgumentException("walking step requires y");
-            var walk=new IoWalkStepTask(new BlockPos(x,y,z));
+            var walk=hasY ? new IoWalkStepTask(new BlockPos(x,y,z)) : new IoWalkStepTask(x,z,args.path("timeoutMs").asLong(45000));
             beginTask(callId,walk,()->result(callId,walk.failure==null ? "ok" : "failed",walk.failure,json.createObjectNode()),()->json.createObjectNode());
             return;
         }
@@ -1841,22 +2295,35 @@ public final class IoBridge {
 
     private final class IoWalkStepTask extends Task implements ITaskRequiresGrounded {
         private final BlockPos pos;
-        private long started;
+        private final boolean xz;
+        private final long limit;
+        private long started,movedAt;
+        private net.minecraft.util.math.Vec3d last;
         private boolean done,oldBreak,oldPlace,oldParkour;
         private int oldFall;
         private String failure;
-        IoWalkStepTask(BlockPos pos) { this.pos=pos; }
+        IoWalkStepTask(BlockPos pos) { this.pos=pos; xz=false; limit=10000; }
+        IoWalkStepTask(int x,int z,long limit) {
+            if (limit<1000 || limit>120000) throw new IllegalArgumentException("invalid walking timeout");
+            pos=new BlockPos(x,0,z); xz=true; this.limit=limit;
+        }
         @Override protected void onStart() {
-            started=System.currentTimeMillis(); mod.getBehaviour().push(); mod.getBehaviour().avoidBlockBreaking(p->true);
+            started=System.currentTimeMillis(); movedAt=started; last=mod.getPlayer().getPos(); mod.getBehaviour().push(); mod.getBehaviour().avoidBlockBreaking(p->true);
             var settings=mod.getClientBaritoneSettings(); oldBreak=settings.allowBreak.value; oldPlace=settings.allowPlace.value;
             oldParkour=settings.allowParkour.value; oldFall=settings.maxFallHeightNoWater.value;
             settings.allowBreak.value=false; settings.allowPlace.value=false; settings.allowParkour.value=false; settings.maxFallHeightNoWater.value=3;
             mod.getClientBaritone().getPathingBehavior().forceCancel();
         }
         @Override protected Task onTick() {
-            if (mod.getPlayer().isOnGround() && mod.getPlayer().getBlockPos().equals(pos)) { done=true; return null; }
-            if (System.currentTimeMillis()-started>10000) { failure="target_unreachable"; done=true; return null; }
-            if (!mod.getClientBaritone().getCustomGoalProcess().isActive()) mod.getClientBaritone().getCustomGoalProcess().setGoalAndPath(new baritone.api.pathing.goals.GoalBlock(pos));
+            var here=mod.getPlayer().getPos();
+            if (xz) {
+                double dx=here.x-pos.getX()-0.5, dz=here.z-pos.getZ()-0.5;
+                if (dx*dx+dz*dz<=16) { done=true; return null; }
+                if (here.distanceTo(last)>0.5) { last=here; movedAt=System.currentTimeMillis(); }
+                else if (System.currentTimeMillis()-movedAt>6000) { failure="target_unreachable"; done=true; return null; }
+            } else if (mod.getPlayer().isOnGround() && mod.getPlayer().getBlockPos().equals(pos)) { done=true; return null; }
+            if (System.currentTimeMillis()-started>limit) { failure="target_unreachable"; done=true; return null; }
+            if (!mod.getClientBaritone().getCustomGoalProcess().isActive()) mod.getClientBaritone().getCustomGoalProcess().setGoalAndPath(xz ? new baritone.api.pathing.goals.GoalXZ(pos.getX(),pos.getZ()) : new baritone.api.pathing.goals.GoalBlock(pos));
             return null;
         }
         @Override public boolean isFinished() { return done; }
@@ -1929,15 +2396,36 @@ public final class IoBridge {
             this.player = player; this.distance = distance; this.duration = duration; this.arrival = arrival;
         }
         @Override protected void onStart() { startedAt = System.currentTimeMillis(); }
+        private net.minecraft.util.math.Vec3d lastGoal;
+        private long lastReplan;
         @Override protected Task onTick() {
-            return mod.getEntityTracker().getPlayerEntity(player)
-                    .map(entity -> (Task) new GetToEntityTask(entity, distance)).orElse(null);
+            var found = mod.getEntityTracker().getPlayerEntity(player);
+            if (found.isEmpty()) return null;
+            var entity = found.get();
+            long now = System.currentTimeMillis();
+            var at = entity.getPos();
+            // Baritone plans to where the player was and walks there; once the player has moved on, plan again.
+            if (lastGoal == null) lastGoal = at;
+            else if (now - lastReplan > 700 && at.squaredDistanceTo(lastGoal) >= 4 && !mod.getPlayer().isInRange(entity, distance + 1)) {
+                lastGoal = at; lastReplan = now;
+                mod.getClientBaritone().getPathingBehavior().forceCancel();
+                mod.getClientBaritone().getCustomGoalProcess().onLostControl();
+            }
+            return new GetToEntityTask(entity, distance);
         }
         @Override protected void onStop(Task interrupt) { }
+        private long missingSince;
+        /** A player who vanishes from the tracker for a moment (a teleport, a chunk reload) has not left: gone means gone for a while. */
+        private boolean playerGone() {
+            if (mod.getEntityTracker().getPlayerEntity(player).isPresent()) { missingSince = 0; return false; }
+            long now = System.currentTimeMillis();
+            if (missingSince == 0) missingSince = now;
+            return now - missingSince >= 4000;
+        }
         @Override public boolean isFinished() {
             if (startedAt == 0) return false;
             var target = mod.getEntityTracker().getPlayerEntity(player);
-            return target.isEmpty() || (arrival && target.get().distanceTo(mod.getPlayer()) <= distance)
+            return playerGone() || (arrival && target.isPresent() && target.get().distanceTo(mod.getPlayer()) <= distance)
                     || System.currentTimeMillis() - startedAt >= duration;
         }
         @Override protected boolean isEqual(Task other) { return this == other; }
@@ -1985,6 +2473,15 @@ public final class IoBridge {
         var id = net.minecraft.util.Identifier.of("minecraft", name);
         if (!Registries.ITEM.containsId(id)) { result(callId, "failed", "unknown_item", null); return; }
         if (countOf(name) < count) { result(callId, "failed", "not_carrying", null); return; }
+        if (!args.path("authorizedDrop").asBoolean(false) && IoPolicy.current()!=null) {
+            var player0=MinecraftClient.getInstance().player;
+            for (int i=0;i<player0.getInventory().size();i++) {
+                var stack=player0.getInventory().getStack(i);
+                if (stack.isEmpty() || !Registries.ITEM.getId(stack.getItem()).getPath().equals(name)) continue;
+                String refusal=IoPolicy.current().dropRefusal(stack);
+                if (refusal!=null) { reportBlocked("drop",refusal,name); result(callId,"failed","policy_blocked",null); return; }
+            }
+        }
         int before = countOf(name);
         var task = new IoDropHeldTask(Registries.ITEM.get(id), count, player);
         PartialSupplier observed = () -> json.createObjectNode().put("item", name).put("dropped", task.dropped)
@@ -1999,12 +2496,15 @@ public final class IoBridge {
         private final String player;
         private int dropped;
         private int actions;
+        private int startCount;
+        private long reachedAt;
         private boolean playerGone;
         IoDropHeldTask(net.minecraft.item.Item item, int count, String player) {
             this.item = item; this.count = count; this.player = player;
         }
         @Override protected void onStart() {
             mod.getBehaviour().push(); mod.getBehaviour().addProtectedItems(item);
+            startCount = mod.getItemStorage().getItemCount(item);
         }
         @Override protected Task onTick() {
             if (player != null) {
@@ -2013,7 +2513,18 @@ public final class IoBridge {
                 if (target.get().distanceTo(mod.getPlayer()) > 2)
                     return new GetToEntityTask(target.get(), 2);
                 adris.altoclef.util.helpers.LookHelper.lookAt(mod, target.get().getPos().add(0, 1.2, 0));
+            } else {
+                // Thrown at the feet, items are picked straight back up once their delay is over: throw them level, ahead.
+                var me = mod.getPlayer();
+                var ahead = net.minecraft.util.math.Vec3d.fromPolar(0, me.getYaw()).multiply(4);
+                adris.altoclef.util.helpers.LookHelper.lookAt(mod, me.getEyePos().add(ahead));
+                // Not before the head has come up: the first item would still land at the feet.
+                if (Math.abs(me.getPitch()) > 8) return null;
             }
+            // What was dropped is what the inventory lost, not what each throw predicted: the server may refuse one.
+            dropped = startCount - mod.getItemStorage().getItemCount(item);
+            if (dropped >= count) { if (reachedAt == 0) reachedAt = System.currentTimeMillis(); return null; }
+            reachedAt = 0;
             var cursor = StorageHelper.getItemStackInCursorSlot();
             if (!cursor.isEmpty()) {
                 mod.getItemStorage().getSlotThatCanFitInPlayerInventory(cursor, false).ifPresent(destination ->
@@ -2033,12 +2544,11 @@ public final class IoBridge {
                 // A whole inventory slot goes in one throw only when all of it is requested.
                 int button = before <= count - dropped ? 1 : 0;
                 mod.getSlotHandler().clickSlot(source, button, net.minecraft.screen.slot.SlotActionType.THROW);
-                dropped += before - StorageHelper.getItemStackInSlot(source).getCount();
                 actions++;
             }
             return null;
         }
-        @Override public boolean isFinished() { return dropped >= count || playerGone; }
+        @Override public boolean isFinished() { return (dropped >= count && reachedAt != 0 && System.currentTimeMillis() - reachedAt >= 400) || playerGone; }
         @Override protected void onStop(Task interrupt) { mod.getBehaviour().pop(); }
         @Override protected boolean isEqual(Task other) { return this == other; }
         @Override protected String toDebugString() { return "IO drop held " + item; }
@@ -2054,6 +2564,11 @@ public final class IoBridge {
     private void startPortal(String callId, boolean enter) {
         if (WorldHelper.getCurrentDimension() != Dimension.OVERWORLD) {
             result(callId, "failed", "start_in_overworld", null);
+            return;
+        }
+        if (enter && !IoPolicy.current().dimensionAllowed("minecraft:the_nether")) {
+            reportBlocked("portal","dimension_not_allowed","minecraft:the_nether");
+            result(callId, "failed", "policy_blocked", null);
             return;
         }
         Task task = enter ? new DefaultGoToDimensionTask(Dimension.NETHER) : new ConstructNetherPortalBucketTask() {
@@ -2208,6 +2723,12 @@ public final class IoBridge {
             pushState(true);
             onDone.run();
         });
+        // Getting somewhere is not a reason to cut down the snow, grass, flowers or crops on the way.
+        if (movesOnly(runningOp)) mod.getBehaviour().avoidBlockBreaking(pos -> decorative(pos));
+        // The behaviour layer this task runs in (made by the runner's enable) must avoid what the policy forbids
+        // breaking or placing, so searches and paths go elsewhere instead of blacklisting protected blocks one by one.
+        mod.getBehaviour().avoidBlockBreaking(pos -> policyForbidsBreaking(pos));
+        mod.getBehaviour().avoidBlockPlacing(pos -> policyForbidsPlacing(pos));
     }
 
     private void onCancel(String callId) {
@@ -2271,6 +2792,10 @@ public final class IoBridge {
             enabledForRespawn=false;
             if (runningCallId==null) mod.getTaskRunner().disable();
         }
+        // The survival chains (food, mob defence, MLG bucket, world survival, unstuck) only run while the task
+        // runner does, and it stops with every user task: keep it running whenever the body is in a world.
+        if (welcomed && AltoClef.inGame() && !mod.getTaskRunner().isActive() && !mod.isPaused()) mod.getTaskRunner().enable();
+        if (welcomed) { trackChains(); trackEating(); guardPortal(); trackOwnDrops(); }
         if (runningCallId != null && mod.getPlayer() != null
                 && mod.getPlayer().currentScreenHandler instanceof net.minecraft.screen.CraftingScreenHandler)
             usedCraftingTable = true;
@@ -2290,6 +2815,129 @@ public final class IoBridge {
             }
             pushState(false);
         }
+    }
+
+    private String chainNow;
+    private long chainSince;
+    private boolean chainPreemptedUser;
+    /** The chain in charge changed: say which started and which finished, with what it displaced (O1.5). */
+    private void trackChains() {
+        var chain=mod.getTaskRunner().getCurrentTaskChain();
+        // A chain that bids 0 has nothing to do: Mob Defense wins by default between Core's calls, and must not be
+        // reported (or counted as acting) when no mob is about.
+        boolean acting=chain!=null && (mod.getTaskRunner().getCurrentPriority()>0 || "User Tasks".equals(chain.getName()));
+        String name=acting ? chain.getName() : null;
+        if (java.util.Objects.equals(name,chainNow)) return;
+        long now=System.currentTimeMillis();
+        String previous=chainNow;
+        if (previous!=null && !"User Tasks".equals(previous)) chainEvent("chain_finished",previous,chainPreemptedUser,now-chainSince);
+        chainNow=name; chainSince=now;
+        if (name!=null && !"User Tasks".equals(name)) {
+            chainPreemptedUser=runningCallId!=null;
+            chainEvent("chain_started",name,chainPreemptedUser,0);
+        }
+    }
+    /** Calls whose job is to get somewhere or carry something: they have no business breaking scenery. */
+    private static boolean movesOnly(String op) {
+        return "task.goto".equals(op) || "task.follow".equals(op) || "task.give".equals(op)
+                || "task.deposit".equals(op) || "task.portal".equals(op);
+    }
+    /** Snow, grass, ferns, flowers, crops and berry bushes: walked through or around, never mined for the way. */
+    private static boolean decorative(BlockPos pos) {
+        var world=MinecraftClient.getInstance().world;
+        if (world==null || !world.isChunkLoaded(pos)) return false;
+        var state=world.getBlockState(pos);
+        return state.isOf(net.minecraft.block.Blocks.SNOW)
+                || state.isIn(net.minecraft.registry.tag.BlockTags.REPLACEABLE)
+                || state.isIn(net.minecraft.registry.tag.BlockTags.FLOWERS)
+                || state.isIn(net.minecraft.registry.tag.BlockTags.CROPS)
+                || state.isOf(net.minecraft.block.Blocks.SWEET_BERRY_BUSH);
+    }
+    private static boolean policyForbidsBreaking(BlockPos pos) {
+        var policy=IoPolicy.current(); var world=MinecraftClient.getInstance().world;
+        if (policy==null || world==null || !world.isChunkLoaded(pos)) return false;
+        return policy.breakRefusal(pos,world.getBlockState(pos).getBlock(),world.getRegistryKey().getValue().toString())!=null;
+    }
+    private static boolean policyForbidsPlacing(BlockPos pos) {
+        var policy=IoPolicy.current(); var world=MinecraftClient.getInstance().world;
+        return policy!=null && world!=null && policy.regionAt(pos,world.getRegistryKey().getValue().toString())!=null;
+    }
+    private BlockPos lastOutsidePortal;
+    private long portalRetreatAt;
+    /**
+     * Entering a portal changes dimension, which is not the body's to do on its own (6.7): standing in
+     * one without a Core call for it is turned back, the work that led there is stopped and Core is told.
+     * Baritone already routes around portal blocks, so this catches the body being put in one.
+     */
+    private void guardPortal() {
+        var player=mod.getPlayer(); var policy=IoPolicy.current();
+        if (player==null || policy==null || mod.getWorld()==null) return;
+        var feet=player.getBlockPos(); var world=mod.getWorld();
+        boolean inPortal=world.getBlockState(feet).isOf(net.minecraft.block.Blocks.NETHER_PORTAL)
+                || world.getBlockState(feet.up()).isOf(net.minecraft.block.Blocks.NETHER_PORTAL)
+                || adris.altoclef.util.helpers.WorldHelper.isInNetherPortal();
+        if (!inPortal) { lastOutsidePortal=player.getBlockPos(); return; }
+        if (portalAuthorized() || lastOutsidePortal==null) return;
+        long now=System.currentTimeMillis();
+        reportBlocked("portal","dimension_change_unasked",lastOutsidePortal.getX()+","+lastOutsidePortal.getY()+","+lastOutsidePortal.getZ());
+        if (runningCallId!=null) {
+            String callId=runningCallId;
+            cancelling=true; mod.cancelUserTask(); smeltFuel=null; runningCallId=null;
+            result(callId,"failed","policy_blocked",null);
+        }
+        if (now-portalRetreatAt>1500) {
+            portalRetreatAt=now;
+            mod.getClientBaritone().getCustomGoalProcess().setGoalAndPath(new baritone.api.pathing.goals.GoalBlock(lastOutsidePortal));
+        }
+    }
+
+    /** Item entities that appeared at IO's feet: IO's own drops, whose pickup by a player counts as given. */
+    private final java.util.Set<Integer> ownDrops=new java.util.HashSet<>();
+    private final java.util.Set<Integer> seenItems=new java.util.HashSet<>();
+    private void trackOwnDrops() {
+        var player=mod.getPlayer(); var world=mod.getWorld();
+        if (player==null || world==null) return;
+        var present=new java.util.HashSet<Integer>();
+        for (var entity:world.getEntities()) {
+            if (!(entity instanceof net.minecraft.entity.ItemEntity item)) continue;
+            present.add(item.getId());
+            if (seenItems.add(item.getId()) && item.squaredDistanceTo(player)<=9) ownDrops.add(item.getId());
+        }
+        seenItems.retainAll(present); ownDrops.retainAll(present);
+    }
+    /** The game's pickup animation names the item entity and who took it: a player taking IO's drop is a give. */
+    public static void itemPickedUp(net.minecraft.entity.Entity item,net.minecraft.entity.Entity collector,int amount) {
+        var bridge=instance; if (bridge!=null) bridge.pickedUp(item,collector,amount);
+    }
+    private void pickedUp(net.minecraft.entity.Entity entity,net.minecraft.entity.Entity collector,int amount) {
+        if (!(entity instanceof net.minecraft.entity.ItemEntity item) || !ownDrops.remove(item.getId())) return;
+        if (!(collector instanceof net.minecraft.entity.player.PlayerEntity who) || collector==mod.getPlayer()) return;
+        var event=json.createObjectNode().put("kind","item_given").put("at",Instant.now().toString());
+        event.putObject("detail").put("player",who.getName().getString())
+                .put("item",Registries.ITEM.getId(item.getStack().getItem()).getPath()).put("count",amount);
+        send("body.event",event);
+    }
+
+    private boolean eatingNow;
+    private long eatingSince;
+    /** The food chain eats by holding the use key beside whatever is running, never as the chain in charge: report it as one. */
+    private void trackEating() {
+        boolean eating=mod.getFoodChain().isTryingToEat();
+        if (eating==eatingNow) return;
+        long now=System.currentTimeMillis();
+        eatingNow=eating;
+        if (eating) { eatingSince=now; chainEvent("chain_started","Food",runningCallId!=null,0); }
+        else chainEvent("chain_finished","Food",runningCallId!=null,now-eatingSince);
+    }
+    private void chainEvent(String kind,String chain,boolean preemptedUser,long durationMs) {
+        var event=json.createObjectNode().put("kind",kind).put("at",Instant.now().toString());
+        var detail=event.putObject("detail");
+        detail.put("chain",chain).put("preemptedUserTask",preemptedUser);
+        if (kind.equals("chain_finished")) detail.put("durationMs",durationMs);
+        var player=MinecraftClient.getInstance().player;
+        if (player!=null) detail.put("health",player.getHealth()).put("food",player.getHungerManager().getFoodLevel());
+        if (runningCallId!=null) detail.put("callId",runningCallId);
+        send("body.event",event);
     }
 
     private void pushState(boolean force) {
@@ -2328,7 +2976,7 @@ public final class IoBridge {
         }
         ArrayNode running = p.putArray("running");
         if (runningCallId != null) running.add(runningCallId);
-        p.put("chain", runningCallId != null ? "User Tasks" : null);
+        p.put("chain", chainNow);
 
         // Pushed on change, at most four a second.
         String compare = p.toString();

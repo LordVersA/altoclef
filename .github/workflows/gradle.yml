@@ -2,21 +2,21 @@ name: Java CI with Gradle
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     env:
-      LATEST_VERSION: "1.21"
-      INCLUDE_DEVLIBS: "true"
-      
+      LATEST_VERSION: '1.21'
+      INCLUDE_DEVLIBS: 'true'
+
       # Warning: Don't add too many versions because it takes a lot of space in the artifacts,
       # and I've gotten an email from GitHub about it so please just don't.
-      VERSIONS_TO_BUILD: "1.16.5 1.17.1 1.18.2 1.20.4 1.21"
+      VERSIONS_TO_BUILD: '1.16.5 1.17.1 1.18.2 1.20.4 1.21'
 
     steps:
       - uses: actions/checkout@v2

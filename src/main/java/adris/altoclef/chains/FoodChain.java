@@ -269,7 +269,9 @@ public class FoodChain extends SingleTaskChain {
         for (ItemStack stack : mod.getItemStorage().getItemStacksPlayerInventory(true)) {
             if (ItemVer.isFood(stack)) {
                 // Ignore protected items
-                if (!ItemHelper.canThrowAwayStack(mod, stack)) continue;
+                // Only protected items are off the menu. `canThrowAwayStack` is false for everything when the
+                // companion settings keep unused items, which left a starving bot with food it would not eat.
+                if (ItemHelper.isStackProtected(mod, stack)) continue;
 
                 // Ignore spider eyes
                 if (stack.getItem() == Items.SPIDER_EYE) {

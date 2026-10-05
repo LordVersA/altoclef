@@ -38,8 +38,11 @@ public class UnstuckChain extends SingleTaskChain {
     }
 
 
-    private void checkStuckInWater() {
-        if (posHistory.size() < 100) return;
+    private void checkStuckInWater() { checkStuckInWater(100); }
+
+    /** `window` ticks of hardly moving, in water, with the head out of it. */
+    private void checkStuckInWater(int window) {
+        if (posHistory.size() < window) return;
 
         ClientWorld world = AltoClef.getInstance().getWorld();
         ClientPlayerEntity player = AltoClef.getInstance().getPlayer();
@@ -55,13 +58,14 @@ public class UnstuckChain extends SingleTaskChain {
             return;
         }
 
-        // do NOT do anything if underwater
-        if (player.getAir() < player.getMaxAir()) {
+        // do NOT do anything while the head is under water. Air alone is no sign of that: a body bobbing at
+        // the surface of a pool it cannot climb out of swims up each time its air dips, and would never be helped.
+        if (player.isSubmergedInWater()) {
             return;
         }
 
         Vec3d pos1 = posHistory.get(0);
-        for (int i = 1; i < 100; i++) {
+        for (int i = 1; i < window; i++) {
             Vec3d pos2 = posHistory.get(i);
             if (Math.abs(pos1.getX() - pos2.getX()) > 0.75 || Math.abs(pos1.getZ() - pos2.getZ()) > 0.75) {
                 return;
@@ -140,7 +144,8 @@ public class UnstuckChain extends SingleTaskChain {
 
     @Override
     public float getPriority() {
-        if (mainTask instanceof GetOutOfWaterTask && mainTask.isActive()) {
+        // A task just handed to the chain has not started yet, so `isActive` alone would never let it run.
+        if (mainTask instanceof GetOutOfWaterTask && !mainTask.stopped() && !mainTask.isFinished()) {
             return 55;
         }
 
@@ -148,8 +153,19 @@ public class UnstuckChain extends SingleTaskChain {
 
         AltoClef mod = AltoClef.getInstance();
 
-        if (!AltoClef.inGame() || MinecraftClient.getInstance().isPaused() || !mod.getUserTaskChain().isActive())
+        if (!AltoClef.inGame() || MinecraftClient.getInstance().isPaused())
             return Float.NEGATIVE_INFINITY;
+
+        // An idle body (IO keeps the chains running between tasks) still has to get itself out of a pool it
+        // cannot climb from: only that check runs without a user task.
+        if (!mod.getUserTaskChain().isActive()) {
+            posHistory.addFirst(mod.getPlayer().getPos());
+            if (posHistory.size() > 500) posHistory.removeLast();
+            // A body bobbing at the surface touches the bottom of the pool now and then, which restarts
+            // the count: a shorter window than the working one still has to come round.
+            checkStuckInWater(40);
+            return mainTask instanceof GetOutOfWaterTask && !mainTask.stopped() ? 55 : Float.NEGATIVE_INFINITY;
+        }
 
         if (StorageHelper.isBlastFurnaceOpen() || StorageHelper.isSmokerOpen() || StorageHelper.isChestOpen() || StorageHelper.isBigCraftingOpen()) {
             return Float.NEGATIVE_INFINITY;
